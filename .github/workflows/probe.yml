@@ -111,9 +111,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          function Call($name, $args, $id) {
+          function Call($name, $toolArgs, $id) {
             $body = @{ jsonrpc = "2.0"; id = $id; method = "tools/call"
-                       params = @{ name = $name; arguments = $args } } | ConvertTo-Json -Depth 8
+                       params = @{ name = $name; arguments = $toolArgs } } | ConvertTo-Json -Depth 8
+            Write-Host ">>> $name $(($toolArgs | ConvertTo-Json -Compress))"
             try {
               $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
                     -ContentType "application/json" -Body $body `
