@@ -106,6 +106,26 @@ jobs:
 
           "MCP_ANSWERED=$answered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Are the calibration robots registered?
+        if: env.MCP_ANSWERED == 'True'
+        shell: pwsh
+        run: |
+          # A robot the compiler accepted but the factory never registered is
+          # invisible to bot_create, and the failure looks like a typo in the
+          # name rather than a missing attribute.
+          $body = @{ jsonrpc = "2.0"; id = 9; method = "tools/call"
+                     params = @{ name = "bot_get_list"; arguments = @{} } } | ConvertTo-Json -Depth 6
+          try {
+            $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
+                  -ContentType "application/json" -Body $body `
+                  -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 30
+            New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+            $r | ConvertTo-Json -Depth 20 | Set-Content artifacts/bot_get_list.json -Encoding utf8
+            Write-Host "bot_get_list answered"
+          } catch {
+            Write-Host "bot_get_list failed: $($_.Exception.Message)"
+          }
+
       - name: Save the whole tool surface, schemas and all
         if: env.MCP_ANSWERED == 'True'
         shell: pwsh
