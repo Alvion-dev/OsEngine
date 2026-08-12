@@ -106,25 +106,42 @@ jobs:
 
           "MCP_ANSWERED=$answered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Are the calibration robots registered?
+      - name: Open the tester and see if the factory knows our robots
         if: env.MCP_ANSWERED == 'True'
         shell: pwsh
         run: |
-          # A robot the compiler accepted but the factory never registered is
-          # invisible to bot_create, and the failure looks like a typo in the
-          # name rather than a missing attribute.
-          $body = @{ jsonrpc = "2.0"; id = 9; method = "tools/call"
-                     params = @{ name = "bot_get_list"; arguments = @{} } } | ConvertTo-Json -Depth 6
-          try {
-            $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
-                  -ContentType "application/json" -Body $body `
-                  -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 30
-            New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-            $r | ConvertTo-Json -Depth 20 | Set-Content artifacts/bot_get_list.json -Encoding utf8
-            Write-Host "bot_get_list answered"
-          } catch {
-            Write-Host "bot_get_list failed: $($_.Exception.Message)"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          function Call($name, $args, $id) {
+            $body = @{ jsonrpc = "2.0"; id = $id; method = "tools/call"
+                       params = @{ name = $name; arguments = $args } } | ConvertTo-Json -Depth 8
+            try {
+              $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
+                    -ContentType "application/json" -Body $body `
+                    -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 60
+              $r | ConvertTo-Json -Depth 25 | Set-Content "artifacts/$name.json" -Encoding utf8
+              $err = $r.result.IsError
+              Write-Host "--- $name : $(if ($err) { 'REFUSED' } else { 'ok' })"
+              if ($err) { Write-Host "    $($r.result.Content[0].Text)" }
+              return $r
+            } catch {
+              Write-Host "--- $name : HTTP FAILURE $($_.Exception.Message)"
+              return $null
+            }
           }
+
+          # bot_get_list needs a mode that supports robots; without it the
+          # refusal reads like a missing robot rather than a missing terminal.
+          Call "terminal_launch" @{ mode = "tester" } 10 | Out-Null
+          Start-Sleep -Seconds 25
+          Call "terminal_get_status" @{} 11 | Out-Null
+          Call "bot_get_list" @{} 12 | Out-Null
+
+          # The real question: can the factory build what we added? A robot the
+          # compiler accepted but the factory never registered is invisible here.
+          foreach ($bot in @("CalibBuyAndHold", "CalibRandomEntry", "CalibLookahead")) {
+            Call "bot_create" @{ name = "probe$bot"; strategy_name = $bot } (100 + $bot.Length) | Out-Null
+          }
+          Call "bot_get_list" @{} 20 | Out-Null
 
       - name: Save the whole tool surface, schemas and all
         if: env.MCP_ANSWERED == 'True'
