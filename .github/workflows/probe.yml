@@ -1,0 +1,127 @@
+name: probe
+
+# Can OsEngine be driven headlessly on a hosted Windows runner?
+#
+# The whole calibration plan depends on this one unknown. OsEngine is a WPF
+# application and its MCP server lives inside MainWindow, so the server only
+# exists if the window does. GitHub's Windows runners have a desktop session but
+# nobody is logged in at it, and that is exactly the case that decides whether a
+# WPF app starts or dies on launch.
+#
+# Nothing here trades, connects to a broker, or needs a credential. It builds,
+# starts the application, and asks its MCP server to say hello.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build OsEngine
+        working-directory: project
+        run: dotnet build OsEngine/OsEngine.csproj -c Release -v minimal
+
+      - name: Turn the MCP server on before first launch
+        working-directory: project
+        shell: pwsh
+        run: |
+          # McpSettings reads Engine\McpSettings.txt line by line: port, api key,
+          # enabled, full log, allowed IPs. Written here because the only other
+          # way to enable it is a checkbox in a window nobody can click.
+          $out = Get-ChildItem -Recurse -Filter OsEngine.exe -Path OsEngine/bin | Select-Object -First 1
+          if (-not $out) { throw "OsEngine.exe not found after build" }
+          $dir = $out.Directory.FullName
+          Write-Host "built at: $dir"
+          New-Item -ItemType Directory -Force -Path "$dir\Engine" | Out-Null
+          Set-Content -Path "$dir\Engine\McpSettings.txt" -Value @(
+            "6500",
+            "osengine-mcp-default-key",
+            "true",
+            "true",
+            ""
+          )
+          "OSENGINE_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Start OsEngine and ask its MCP server to say hello
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:OSENGINE_DIR "OsEngine.exe"
+          Write-Host "starting $exe"
+          $proc = Start-Process -FilePath $exe -WorkingDirectory $env:OSENGINE_DIR -PassThru
+          Write-Host "pid: $($proc.Id)"
+
+          $body = @{
+            jsonrpc = "2.0"; id = 1; method = "initialize"
+            params = @{
+              protocolVersion = "2024-11-05"
+              capabilities = @{}
+              clientInfo = @{ name = "calibration-probe"; version = "1.0.0" }
+            }
+          } | ConvertTo-Json -Depth 6
+
+          $deadline = (Get-Date).AddMinutes(6)
+          $answered = $false
+          while ((Get-Date) -lt $deadline) {
+            if ($proc.HasExited) {
+              Write-Host "!! OsEngine exited on its own, code $($proc.ExitCode)"
+              break
+            }
+            try {
+              $r = Invoke-RestMethod -Uri "http://localhost:6500" -Method Post `
+                    -ContentType "application/json" -Body $body `
+                    -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 10
+              Write-Host "MCP answered:"
+              $r | ConvertTo-Json -Depth 8
+              $answered = $true
+              break
+            } catch {
+              Start-Sleep -Seconds 5
+            }
+          }
+
+          if (-not $answered) {
+            Write-Host "=== listening ports ==="
+            netstat -ano | Select-String "LISTEN" | Select-Object -First 40
+            Write-Host "=== process alive? ==="
+            Get-Process -Id $proc.Id -ErrorAction SilentlyContinue | Format-List Id,ProcessName,Responding
+          }
+
+          "MCP_ANSWERED=$answered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Ask what tools it offers
+        if: env.MCP_ANSWERED == 'True'
+        shell: pwsh
+        run: |
+          $body = @{ jsonrpc = "2.0"; id = 2; method = "tools/list"; params = @{} } | ConvertTo-Json -Depth 5
+          $r = Invoke-RestMethod -Uri "http://localhost:6500" -Method Post `
+                -ContentType "application/json" -Body $body `
+                -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 20
+          $names = $r.result.tools | ForEach-Object { $_.name }
+          Write-Host "tools offered: $($names.Count)"
+          $names | Where-Object { $_ -like "tester*" -or $_ -like "optimizer*" -or $_ -like "data*" }
+
+      - name: Collect whatever it wrote down
+        if: always()
+        shell: pwsh
+        run: |
+          $logs = Get-ChildItem -Recurse -Path $env:OSENGINE_DIR -Include *.txt,*.log `
+                    -ErrorAction SilentlyContinue | Select-Object -First 40
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          foreach ($l in $logs) { Copy-Item $l.FullName -Destination artifacts -ErrorAction SilentlyContinue }
+          Get-ChildItem artifacts | Format-Table Name,Length
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: osengine-probe-logs
+          path: artifacts
+          if-no-files-found: ignore
