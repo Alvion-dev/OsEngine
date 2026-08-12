@@ -37,10 +37,21 @@ jobs:
           # McpSettings reads Engine\McpSettings.txt line by line: port, api key,
           # enabled, full log, allowed IPs. Written here because the only other
           # way to enable it is a checkbox in a window nobody can click.
-          $out = Get-ChildItem -Recurse -Filter OsEngine.exe -Path OsEngine/bin | Select-Object -First 1
-          if (-not $out) { throw "OsEngine.exe not found after build" }
+          # The repository ships 665 prebuilt files under bin/Debug. Searching
+          # bin/ and taking the first match started that committed binary --
+          # built long before our robots existed -- while the fresh Release
+          # output sat untouched. The build passed and the robots were missing,
+          # and the error said "Unknown strategy".
+          $out = Get-ChildItem -Recurse -Filter OsEngine.exe -Path OsEngine/bin/Release |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $out) { throw "no Release build of OsEngine.exe found" }
+          $age = (Get-Date) - $out.LastWriteTime
+          Write-Host "built at: $($out.Directory.FullName)"
+          Write-Host "exe written: $($out.LastWriteTime) ($([int]$age.TotalMinutes) min ago)"
+          if ($age.TotalMinutes -gt 30) {
+            throw "OsEngine.exe is $([int]$age.TotalMinutes) min old -- this is not the build we just made"
+          }
           $dir = $out.Directory.FullName
-          Write-Host "built at: $dir"
           New-Item -ItemType Directory -Force -Path "$dir\Engine" | Out-Null
           Set-Content -Path "$dir\Engine\McpSettings.txt" -Value @(
             "6500",
