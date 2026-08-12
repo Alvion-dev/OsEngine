@@ -106,24 +106,43 @@ jobs:
 
           "MCP_ANSWERED=$answered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Ask what tools it offers
+      - name: Save the whole tool surface, schemas and all
         if: env.MCP_ANSWERED == 'True'
         shell: pwsh
         run: |
+          # The names alone are not enough to drive it: each tool has an input
+          # schema, and guessing argument shapes costs a runner round trip each
+          # time. Take the lot once and design against it offline.
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           $body = @{ jsonrpc = "2.0"; id = 2; method = "tools/list"; params = @{} } | ConvertTo-Json -Depth 5
           $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
                 -ContentType "application/json" -Body $body `
-                -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 20
-          $names = $r.result.tools | ForEach-Object { $_.name }
-          Write-Host "tools offered: $($names.Count)"
-          $names | Where-Object { $_ -like "tester*" -or $_ -like "optimizer*" -or $_ -like "data*" }
+                -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 30
+          $r.result | ConvertTo-Json -Depth 30 | Set-Content -Path artifacts/tools.json -Encoding utf8
+          Write-Host "tools offered: $($r.result.tools.Count)"
+
+          # What data sets exist out of the box, and what the tester thinks it
+          # is configured with right now. Both are needed before loading history.
+          foreach ($call in @("data_get_sets", "tester_data_get_config", "tester_execution_get_config", "tester_portfolio_get_config")) {
+            $b = @{ jsonrpc = "2.0"; id = 3; method = "tools/call"
+                    params = @{ name = $call; arguments = @{} } } | ConvertTo-Json -Depth 6
+            try {
+              $resp = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
+                        -ContentType "application/json" -Body $b `
+                        -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 30
+              $resp | ConvertTo-Json -Depth 20 | Set-Content -Path "artifacts/$call.json" -Encoding utf8
+              Write-Host "--- $call : answered"
+            } catch {
+              Write-Host "--- $call : FAILED $($_.Exception.Message)"
+            }
+          }
 
       - name: Collect whatever it wrote down
         if: always()
         shell: pwsh
         run: |
-          $logs = Get-ChildItem -Recurse -Path $env:OSENGINE_DIR -Include *.txt,*.log `
-                    -ErrorAction SilentlyContinue | Select-Object -First 40
+          $logs = Get-ChildItem -Recurse -Path $env:OSENGINE_DIR -Include MCPLog*.txt,*.log `
+                    -ErrorAction SilentlyContinue | Select-Object -First 20
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           foreach ($l in $logs) { Copy-Item $l.FullName -Destination artifacts -ErrorAction SilentlyContinue }
           Get-ChildItem artifacts | Format-Table Name,Length
