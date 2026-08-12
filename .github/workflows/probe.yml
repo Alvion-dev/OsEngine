@@ -76,7 +76,7 @@ jobs:
               break
             }
             try {
-              $r = Invoke-RestMethod -Uri "http://localhost:6500" -Method Post `
+              $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
                     -ContentType "application/json" -Body $body `
                     -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 10
               Write-Host "MCP answered:"
@@ -84,6 +84,15 @@ jobs:
               $answered = $true
               break
             } catch {
+              $status = $null
+              if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+              if ($status) {
+                # The server answered. That is not "not ready" -- it is a wrong
+                # request, and retrying it for six minutes teaches nothing.
+                Write-Host "!! MCP answered HTTP $status -- the server is up and rejected the request"
+                Write-Host $_.ErrorDetails.Message
+                break
+              }
               Start-Sleep -Seconds 5
             }
           }
@@ -102,7 +111,7 @@ jobs:
         shell: pwsh
         run: |
           $body = @{ jsonrpc = "2.0"; id = 2; method = "tools/list"; params = @{} } | ConvertTo-Json -Depth 5
-          $r = Invoke-RestMethod -Uri "http://localhost:6500" -Method Post `
+          $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
                 -ContentType "application/json" -Body $body `
                 -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 20
           $names = $r.result.tools | ForEach-Object { $_.name }
