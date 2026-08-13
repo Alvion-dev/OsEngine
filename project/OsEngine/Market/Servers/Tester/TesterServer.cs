@@ -1273,7 +1273,7 @@ namespace OsEngine.Market.Servers.Tester
 
         private void Probe(string verdict, Order order, Candle lastCandle)
         {
-            if (_probeCount >= 60)
+            if (_probeCount >= 250)
             {
                 return;
             }
@@ -1281,7 +1281,8 @@ namespace OsEngine.Market.Servers.Tester
 
             SendLogMessage(
                 "PROBE " + verdict
-                + " | side=" + order.Side
+                + " | sec=" + order.SecurityNameCode
+                + " side=" + order.Side
                 + " type=" + order.TypeOrder
                 + " stopOrProfit=" + order.IsStopOrProfit
                 + " price=" + order.Price

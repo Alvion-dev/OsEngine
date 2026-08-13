@@ -472,13 +472,25 @@ jobs:
             # Один робот на непрерывной бумаге — случай, где закрытий ноль.
             # Больше ничего в симуляции нет, чтобы в логе замера была одна
             # история, а не четыре вперемешку.
+            # Два оставшихся вопроса закрываются одним прогоном.
+            #   GAP10 / просить каждый бар — здесь ловится момент, когда разрыв
+            #     спасает: разрыв в этих данных каждые десять баров, значит
+            #     попадёт в первые же записи замера.
+            #   NOGAP / просить один раз — здесь ловится, почему единственная
+            #     просьба не срабатывает вообще.
             $bots = @{}
-            $target = ($secs.securities | Where-Object { $_.name -eq "NOGAP" } | Select-Object -First 1)
-            if (-not $target) { throw "бумага NOGAP не загрузилась" }
-            $bots["NOGAP"] = NewCalibBot "CalibRandomEntry" @{
-              "Regime" = "On"; "Volume" = 1; "Seed" = 20260812
-              "Hold candles" = 1; "Try entry every N candles" = 1
-              "Ask to close once" = "No" } $target.name
+            $plan = @(
+              @{ sec = "GAP10"; once = "No"  },
+              @{ sec = "NOGAP"; once = "Yes" }
+            )
+            foreach ($it in $plan) {
+              $target = ($secs.securities | Where-Object { $_.name -eq $it.sec } | Select-Object -First 1)
+              if (-not $target) { throw "бумага $($it.sec) не загрузилась" }
+              $bots["$($it.sec)/$($it.once)"] = NewCalibBot "CalibRandomEntry" @{
+                "Regime" = "On"; "Volume" = 1; "Seed" = 20260812
+                "Hold candles" = 1; "Try entry every N candles" = 1
+                "Ask to close once" = $it.once } $target.name
+            }
 
             RunTester
 
@@ -493,13 +505,13 @@ jobs:
             Write-Host ""
             Write-Host "=== ЗАМЕР ИЗ ЗАСЛОНОВ ==="
             $logs = Get-ChildItem -Recurse -Path $env:OSENGINE_DIR -Include *.txt -ErrorAction SilentlyContinue
-            $hits = $logs | Select-String -Pattern "PROBE" -ErrorAction SilentlyContinue
+            $hits = $logs | Select-String -Pattern "PROBE|CLOSEPROBE" -ErrorAction SilentlyContinue
             if (-not $hits) {
               Write-Host "  строк замера не найдено — лог тестера пишется не в *.txt под OSENGINE_DIR"
               Write-Host "  файлы, которые есть:"
               $logs | Select-Object -First 15 | ForEach-Object { Write-Host "    $($_.FullName)" }
             } else {
-              $hits | Select-Object -First 60 | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+              $hits | Select-Object -First 120 | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
             }
             Write-Host "=== опыт завершён ==="
             exit 0

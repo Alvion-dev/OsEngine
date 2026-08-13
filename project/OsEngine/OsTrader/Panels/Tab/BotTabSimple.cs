@@ -4309,6 +4309,32 @@ namespace OsEngine.OsTrader.Panels.Tab
         /// </summary>
         /// <param name="position">position to be closed</param>
         /// <param name="volume">volume</param>
+        // CALIBRATION PROBE. A closing order asked once never fills, and this
+        // method has three silent early exits that would explain it. Which one
+        // fires is a question for the code itself, not for another reading of
+        // it. Remove with the probe.
+        private static int _closeProbeCount;
+
+        private void CloseProbe(string verdict, Position position)
+        {
+            if (_closeProbeCount >= 250)
+            {
+                return;
+            }
+            _closeProbeCount++;
+
+            SetNewLogMessage(
+                "CLOSEPROBE " + verdict
+                + " | sec=" + (Security == null ? "?" : Security.Name)
+                + " state=" + position.State
+                + " openVolume=" + position.OpenVolume
+                + " maxVolume=" + position.MaxVolume
+                + " bestAsk=" + _connector.BestAsk
+                + " bestBid=" + _connector.BestBid
+                + " time=" + TimeServerCurrent.ToString("yyyy-MM-dd HH:mm:ss"),
+                LogMessageType.System);
+        }
+
         public void CloseAtMarket(Position position, decimal volume)
         {
             try
@@ -4316,6 +4342,7 @@ namespace OsEngine.OsTrader.Panels.Tab
                 if (_connector.IsConnected == false
                     || _connector.IsReadyToTrade == false)
                 {
+                    CloseProbe("exit-not-ready", position);
                     SetNewLogMessage(OsLocalization.Trader.Label191, LogMessageType.Error);
                     return;
                 }
@@ -4325,15 +4352,19 @@ namespace OsEngine.OsTrader.Panels.Tab
 
                 if (volume <= 0 || position.OpenVolume <= 0)
                 {
+                    CloseProbe("exit-no-open-volume", position);
                     return;
                 }
                 decimal price = (decimal)_connector.BestAsk;
 
                 if (price == 0)
                 {
+                    CloseProbe("exit-no-price", position);
                     SetNewLogMessage(OsLocalization.Trader.Label290, LogMessageType.System);
                     return;
                 }
+
+                CloseProbe("proceed", position);
                 if (StartProgram == StartProgram.IsOsTrader)
                 {
                     if (position.Direction == Side.Buy)
