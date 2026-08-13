@@ -98,6 +98,18 @@ namespace OsEngine.Robots.Calibration
 
             if (now >= exit.Date && _tab.PositionsOpenAll.Count > 0)
             {
+                // Only a genuinely open position can be closed; one that is
+                // still Opening swallows the request in silence. Here the hold
+                // lasts years so it can hardly matter, but the check costs
+                // nothing and the rule is the same one that cost a day to find.
+                Position position = _tab.PositionsOpenAll[0];
+
+                if (position.State != PositionStateType.Open
+                    || position.OpenVolume <= 0)
+                {
+                    return;
+                }
+
                 _tab.CloseAllAtMarket();
                 _exited = true;
             }

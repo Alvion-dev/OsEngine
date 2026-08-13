@@ -75,7 +75,7 @@ namespace OsEngine.Robots.Calibration
             // TesterServer.cs:1331 (`order.TimeCreate >= lastCandle.TimeStart`)
             // rejected it every time because TimeCreate had just been reset to
             // the current bar.
-            _closeOnce = CreateParameter("Ask to close once", "No", new[] { "No", "Yes" });
+            _closeOnce = CreateParameter("Ask to close once", "Yes", new[] { "Yes", "No" });
 
             _tab.CandleFinishedEvent += CandleFinished;
 
@@ -112,16 +112,46 @@ namespace OsEngine.Robots.Calibration
 
             if (_tab.PositionsOpenAll.Count > 0)
             {
-                if (_candlesSeen - _candleOfEntry >= _holdCandles.ValueInt)
+                if (_candlesSeen - _candleOfEntry < _holdCandles.ValueInt)
                 {
-                    if (_closeOnce.ValueString == "Yes" && _closeAsked)
-                    {
-                        return;
-                    }
-
-                    _tab.CloseAllAtMarket();
-                    _closeAsked = true;
+                    return;
                 }
+
+                if (_closeOnce.ValueString == "No")
+                {
+                    // The obvious way to write an exit, and the way that does
+                    // not work. Kept so the defect can be reproduced on demand.
+                    _tab.CloseAllAtMarket();
+                    return;
+                }
+
+                if (_closeAsked)
+                {
+                    return;
+                }
+
+                // Two rules this engine enforces silently, both established by
+                // instrumenting it rather than by reading it -- see ENGINES.md.
+                //
+                // A position that merely exists is not yet a position that can
+                // be closed. Inside one tester step the robot runs BEFORE order
+                // matching, so on the bar after the entry the position is still
+                // Opening with no volume, and CloseAtMarket returns without a
+                // word.
+                //
+                // And a second request destroys the first order and files a new
+                // one, which the tester rejects on the bar it was created. Ask
+                // once, then wait.
+                Position position = _tab.PositionsOpenAll[0];
+
+                if (position.State != PositionStateType.Open
+                    || position.OpenVolume <= 0)
+                {
+                    return;
+                }
+
+                _tab.CloseAllAtMarket();
+                _closeAsked = true;
                 return;
             }
 

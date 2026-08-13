@@ -157,10 +157,10 @@ jobs:
           # Опыт с разрывами доказал своё и выключен; данные и код остались,
           # включается одним флагом. По умолчанию — дневные, на них
           # четвёрка зелёная.
-          $experiment = $true
-          $dataFolder = "Gaps"       # подпапка calibration-data
+          $experiment = $false
+          $dataFolder = "Min1"       # подпапка calibration-data
           $timeFrame  = "Min1"       # TimeFrame движка, должен совпадать с данными
-          $dateFrom   = "2024-01-03T00:00:00"
+          $dateFrom   = "2026-06-01T00:00:00"
           $dateTo     = "2026-07-01T00:00:00"
           $exitDate   = "20260625"   # день, на первом баре которого выходим
 

@@ -66,6 +66,7 @@ namespace OsEngine.Robots.Calibration
         private readonly Dictionary<DateTime, decimal[]> _future = new Dictionary<DateTime, decimal[]>();
         private readonly List<string> _recorded = new List<string>();
         private bool _futureLoaded;
+        private bool _closeAsked;
 
         public CalibLookahead(string name, StartProgram startProgram)
             : base(name, startProgram)
@@ -149,7 +150,20 @@ namespace OsEngine.Robots.Calibration
             // were looked up when it was opened.
             if (_tab.PositionsOpenAll.Count > 0)
             {
+                // Same two rules as CalibRandomEntry: wait until the position
+                // is genuinely open, then ask exactly once. Asking every bar
+                // replaces the order faster than the tester can match it.
+                Position position = _tab.PositionsOpenAll[0];
+
+                if (position.State != PositionStateType.Open
+                    || position.OpenVolume <= 0
+                    || _closeAsked)
+                {
+                    return;
+                }
+
                 _tab.CloseAllAtMarket();
+                _closeAsked = true;
                 return;
             }
 
@@ -165,10 +179,12 @@ namespace OsEngine.Robots.Calibration
             if (exit > entry)
             {
                 _tab.BuyAtMarket(_volume.ValueDecimal);
+                _closeAsked = false;
             }
             else if (exit < entry)
             {
                 _tab.SellAtMarket(_volume.ValueDecimal);
+                _closeAsked = false;
             }
         }
 
