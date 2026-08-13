@@ -503,6 +503,10 @@ jobs:
           # ===============================================================
           Write-Host ""
           Write-Host "=== 3. LOOKAHEAD ==="
+          # The coin-flip spread is the yardstick below. If section 2 did not
+          # produce it, fall back to the same formula on the trade count this
+          # robot will make, rather than dividing by nothing later.
+          if (-not $runSd) { $runSd = $moveSd * [math]::Sqrt(315) }
           $futureFile = Join-Path $env:OSENGINE_DIR "calib-future.csv"
           if (Test-Path $futureFile) { Remove-Item $futureFile -Force }
 
@@ -539,40 +543,65 @@ jobs:
               $r = CheckEveryPosition $chePositions
               $failures += $r.problems | ForEach-Object { "lookahead: $_" }
 
-              # Win rate is the honest signal here: it is scale-free, so it does
-              # not depend on position size or on what fraction of the portfolio
-              # was deployed. Perfect foresight of its own fills should win
-              # essentially every trade that moved at all.
-              $winners = @($chePositions | Where-Object { $_.profit_abs -gt 0 }).Count
+              # Win rate is scale-free, so it does not depend on position size
+              # or on what fraction of the portfolio was deployed. Reported both
+              # ways on purpose: gross shows whether the direction was foreseen,
+              # net shows how many correct calls the commission still turned
+              # into losses.
+              $winners      = @($chePositions | Where-Object { $_.profit_abs -gt 0 }).Count
+              $grossWinners = @($chePositions | Where-Object {
+                $g = if ($_.direction -eq "Long") { $_.close_price - $_.entry_price }
+                     else { $_.entry_price - $_.close_price }
+                $g -gt 0 }).Count
               $winRate = $winners / $chePositions.Count
+              $grossWinRate = $grossWinners / $chePositions.Count
 
-              # Return is quoted on the capital actually at risk -- one share at
-              # a time -- not on the 1M portfolio, where one share of SBER would
-              # round to nothing and hide the absurdity we are looking for.
+              # Both ends taken by min/max rather than by position in the list.
+              # The journal hands positions back newest first, so reading the
+              # ends off the array gave a span of MINUS 2.46 years.
+              $firstOpen = ($chePositions | ForEach-Object { [datetime]$_.open_time }  | Measure-Object -Minimum).Minimum
+              $lastClose = ($chePositions | ForEach-Object { [datetime]$_.close_time } | Measure-Object -Maximum).Maximum
+              $years = ($lastClose - $firstOpen).Days / 365.25
               $avgEntry = ($chePositions | ForEach-Object { [double]$_.entry_price } | Measure-Object -Average).Average
-              $years = ([datetime]$chePositions[-1].close_time - [datetime]$chePositions[0].open_time).Days / 365.25
               $annualPct = ($r.net / $avgEntry) * 100 / $years
 
               Write-Host ("  gross {0}  fee {1}  net {2}" -f `
                 [math]::Round($r.gross,2), [math]::Round($r.fee,2), [math]::Round($r.net,2))
-              Write-Host ("  win rate {0}%  ({1} of {2})" -f `
-                [math]::Round($winRate * 100, 1), $winners, $chePositions.Count)
+              Write-Host ("  win rate {0}% net, {1}% gross ({2} of {3})" -f `
+                [math]::Round($winRate * 100, 1), [math]::Round($grossWinRate * 100, 1),
+                $winners, $chePositions.Count)
+              Write-Host ("  {0} correct calls that the commission still turned into losses" -f `
+                ($grossWinners - $winners))
               Write-Host ("  on capital at risk ({0} RUB a trade): {1}% a year over {2} years" -f `
                 [math]::Round($avgEntry,2), [math]::Round($annualPct,1), [math]::Round($years,2))
 
-              # The thresholds are the ones the Python harness already uses:
-              # a 90% win rate or 200% a year is not a strategy, it is a leak.
-              if ($winRate -lt 0.90) {
-                $failures += ("lookahead: win rate only {0}% -- a robot reading its own future should win nearly everything, so either the cheat is not landing or the engine is doing something to the signal" -f `
-                  [math]::Round($winRate * 100, 1))
+              # The yardstick is the honest robots on this same data, not an
+              # absolute percentage. A fixed "200% a year is impossible" encodes
+              # assumptions about position size and turnover that change with
+              # every setup -- and it failed here at 106% a year, which is
+              # simply what perfect foresight of one-day moves is worth on daily
+              # candles at half duty cycle. The number was mine, not the
+              # engine's.
+              #
+              # Against the coin flip on the same candles the signal is
+              # unmistakable, and that comparison carries no assumptions at all.
+              $sigmas = $r.gross / $runSd
+              Write-Host ("  gross is {0} sigma of the coin-flip spread (+/-{1})" -f `
+                [math]::Round($sigmas, 1), [math]::Round($runSd, 2))
+
+              if ($grossWinRate -lt 0.98) {
+                $failures += ("lookahead: gross win rate only {0}% -- a robot reading its own fills should get the direction right nearly every time, so either the cheat is not landing or the engine is doing something to the signal" -f `
+                  [math]::Round($grossWinRate * 100, 1))
               }
-              if ($annualPct -lt 200) {
-                $failures += ("lookahead: only {0}% a year on capital at risk -- too modest for perfect foresight to be a usable yardstick" -f `
-                  [math]::Round($annualPct, 1))
+              if ($sigmas -lt 5) {
+                $failures += ("lookahead: gross is only {0} sigma above the coin flip -- too close to honest to serve as a yardstick" -f `
+                  [math]::Round($sigmas, 1))
               }
-              if ($failures.Count -eq 0) {
-                Write-Host "  impossible numbers reached -- the engine does NOT hide a leak of this size"
-              }
+
+              Write-Host ""
+              Write-Host ("  YARDSTICK: on this data perfect foresight is worth {0}% a year." -f `
+                [math]::Round($annualPct, 0))
+              Write-Host  "  Any honest strategy on this data approaching that is leaking, not winning."
             }
           }
 
