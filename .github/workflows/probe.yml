@@ -157,9 +157,9 @@ jobs:
           # Опыт с разрывами доказал своё и выключен; данные и код остались,
           # включается одним флагом. По умолчанию — дневные, на них
           # четвёрка зелёная.
-          $experiment = $false
-          $dataFolder = "Daily"      # подпапка calibration-data
-          $timeFrame  = "Day"        # TimeFrame движка, должен совпадать с данными
+          $experiment = $true
+          $dataFolder = "Gaps"       # подпапка calibration-data
+          $timeFrame  = "Min1"       # TimeFrame движка, должен совпадать с данными
           $dateFrom   = "2024-01-03T00:00:00"
           $dateTo     = "2026-07-01T00:00:00"
           $exitDate   = "20260625"   # день, на первом баре которого выходим
@@ -465,22 +465,30 @@ jobs:
             Write-Host "=== ОПЫТ: разрывы ==="
             Write-Host "  бумаги в тестере: $(($secs.securities | ForEach-Object { $_.name }) -join ', ')"
 
+            # Один и тот же робот, одна и та же бумага, разница в одном:
+            # просит ли он закрыть позицию КАЖДЫЙ бар или ровно один раз.
+            # Если дело в том, что заявка переписывается быстрее, чем успевает
+            # исполниться, то «один раз» закроет позиции и на непрерывных барах.
             $bots = @{}
             foreach ($s in $secs.securities) {
-              $bots[$s.name] = NewCalibBot "CalibRandomEntry" @{
-                "Regime" = "On"; "Volume" = 1; "Seed" = 20260812
-                "Hold candles" = 1; "Try entry every N candles" = 1 } $s.name
+              foreach ($once in @("No", "Yes")) {
+                $bots["$($s.name)/$once"] = NewCalibBot "CalibRandomEntry" @{
+                  "Regime" = "On"; "Volume" = 1; "Seed" = 20260812
+                  "Hold candles" = 1; "Try entry every N candles" = 1
+                  "Ask to close once" = $once } $s.name
+              }
             }
 
             RunTester
 
             Write-Host ""
-            foreach ($s in $secs.securities) {
-              $done = ClosedPositions $bots[$s.name]
-              Write-Host ("  {0}: завершённых кругов {1}" -f $s.name, $done.Count)
+            foreach ($k in ($bots.Keys | Sort-Object)) {
+              $done = ClosedPositions $bots[$k]
+              Write-Host ("  {0,-12} завершённых кругов {1}" -f $k, $done.Count)
             }
             Write-Host ""
-            Write-Host "  ожидалось при верной гипотезе: NOGAP около 0, GAP10 около 199"
+            Write-Host "  NOGAP/No  было 0 — воспроизводим известное"
+            Write-Host "  NOGAP/Yes если станет ~1000, причина в перевыставлении заявки"
             Write-Host "=== опыт завершён ==="
             exit 0
           }

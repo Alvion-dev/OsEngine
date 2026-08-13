@@ -45,10 +45,12 @@ namespace OsEngine.Robots.Calibration
         private StrategyParameterInt _seed;
         private StrategyParameterInt _holdCandles;
         private StrategyParameterInt _entryEveryCandles;
+        private StrategyParameterString _closeOnce;
 
         private Random _random;
         private int _candlesSeen;
         private int _candleOfEntry;
+        private bool _closeAsked;
 
         public CalibRandomEntry(string name, StartProgram startProgram)
             : base(name, startProgram)
@@ -61,6 +63,19 @@ namespace OsEngine.Robots.Calibration
             _seed = CreateParameter("Seed", 20260812, 1, 99999999, 1);
             _holdCandles = CreateParameter("Hold candles", 3, 1, 50, 1);
             _entryEveryCandles = CreateParameter("Try entry every N candles", 5, 1, 50, 1);
+
+            // An experiment, not a strategy choice. With "No" the robot asks to
+            // close on every bar while a position is open, which is the obvious
+            // way to write it and what every earlier run did. With "Yes" it asks
+            // exactly once per position.
+            //
+            // If that single difference makes positions close on continuous
+            // minute bars, then the tester was never refusing the order -- the
+            // order was being replaced faster than it could be matched, and
+            // TesterServer.cs:1331 (`order.TimeCreate >= lastCandle.TimeStart`)
+            // rejected it every time because TimeCreate had just been reset to
+            // the current bar.
+            _closeOnce = CreateParameter("Ask to close once", "No", new[] { "No", "Yes" });
 
             _tab.CandleFinishedEvent += CandleFinished;
 
@@ -99,7 +114,13 @@ namespace OsEngine.Robots.Calibration
             {
                 if (_candlesSeen - _candleOfEntry >= _holdCandles.ValueInt)
                 {
+                    if (_closeOnce.ValueString == "Yes" && _closeAsked)
+                    {
+                        return;
+                    }
+
                     _tab.CloseAllAtMarket();
+                    _closeAsked = true;
                 }
                 return;
             }
@@ -124,6 +145,7 @@ namespace OsEngine.Robots.Calibration
             }
 
             _candleOfEntry = _candlesSeen;
+            _closeAsked = false;
         }
     }
 }
