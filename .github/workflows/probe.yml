@@ -275,18 +275,34 @@ jobs:
             throw "tester did not finish in 600s"
           }
 
-          function ClosedPositions($botName) {
+          # include_failed defaults to false, and false means the engine returns
+          # only positions in state Done -- RobotsApi filters on exactly that.
+          # Asking without it hides every position that failed to open or close,
+          # so a robot whose orders are being rejected looks like a robot that
+          # simply traded less. Everything is fetched here and the breakdown is
+          # printed; the checks below still count only Done.
+          function AllPositions($botName) {
             $all = @()
             $offset = 0
             while ($true) {
               $page = Payload (Call "bot_journal_get_closed_positions" @{
-                bot_name = $botName; include_failed = $false; limit = 500; offset = $offset })
+                bot_name = $botName; include_failed = $true; limit = 500; offset = $offset })
               if (-not $page -or $page.count -eq 0) { break }
               $all += $page.positions
               if ($page.positions.Count -lt 500) { break }
               $offset += 500
             }
             return ,$all
+          }
+
+          function ClosedPositions($botName) {
+            $all = AllPositions $botName
+            $byState = $all | Group-Object state | Sort-Object Count -Descending
+            $summary = ($byState | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ", "
+            $open = Payload (Call "bot_journal_get_open_positions" @{
+              bot_name = $botName; limit = 500; offset = 0 })
+            Write-Host "  позиции: всего $($all.Count) [$summary], открытых $($open.count)"
+            return ,@($all | Where-Object { $_.state -eq "Done" })
           }
 
           # Every closed position must be charged (entry + close) * rate on both
@@ -469,7 +485,9 @@ jobs:
           # Four, not eight: on minute bars each run makes thousands of
           # trades instead of three hundred, so the noise band narrows on
           # its own and the runs cost real minutes each.
-          $seeds = @(20260812, 1, 7, 42)
+          # Одно зерно на диагностический прогон: выясняем, почему сделок мало,
+          # а не считаем статистику по четырём одинаковым ответам.
+          $seeds = @(20260812)
           $results = @()
           $previousBot = $bh
 
