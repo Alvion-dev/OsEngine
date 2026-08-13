@@ -20,6 +20,14 @@ The exit is a date rather than "the last candle" because a robot inside a
 backtest is never told which candle is last. Leaving the position open would be
 worse than wrong: the replay refuses to value an open position, so the run would
 report nothing at all rather than something suspicious.
+
+The exit date must leave candles after it, and the first run here proved why.
+Set to the final day of the series, the exit order was placed after the last
+candle finished and had nothing left to fill against. OsEngine then reported
+net_profit 33.60 on deals_count 1 while closed_positions was empty -- the paper
+value of a position that never closed, counted as profit, with its commission
+counted as zero. A measuring instrument that ends holding measures nothing, and
+this engine will not say so on its own.
 */
 
 namespace OsEngine.Robots.Calibration
@@ -44,7 +52,8 @@ namespace OsEngine.Robots.Calibration
 
             _regime = CreateParameter("Regime", "On", new[] { "On", "Off" });
             _volume = CreateParameter("Volume", 1m, 1m, 100m, 1m);
-            _exitDate = CreateParameter("Exit date yyyy-MM-dd", "2026-06-30", new[] { "2026-06-30" });
+            _exitDate = CreateParameter("Exit date yyyy-MM-dd", "2026-06-25",
+                new[] { "2026-06-25", "2026-06-26", "2026-06-29", "2026-06-30" });
 
             _tab.CandleFinishedEvent += CandleFinished;
 

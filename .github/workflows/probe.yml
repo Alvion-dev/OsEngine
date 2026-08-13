@@ -233,8 +233,12 @@ jobs:
           if (-not $securityName) { throw "tester loaded no securities from $data" }
 
           # 6. Now the dates stick: same source, no reload.
+          # date_to is a day past the last candle. LoadNextData pauses the
+          # moment TimeNow passes TimeEnd, and the candles carry a 10:00 stamp,
+          # so "2026-06-30T00:00:00" stops the run before the 29th and the 30th
+          # are ever delivered.
           Say "tester_data_set_config(dates)" (Call "tester_data_set_config" @{
-            date_from = "2024-01-03T00:00:00"; date_to = "2026-06-30T00:00:00" } 14)
+            date_from = "2024-01-03T00:00:00"; date_to = "2026-07-01T00:00:00" } 14)
           Say "tester_portfolio_set_config" (Call "tester_portfolio_set_config" @{
             start_portfolio = 1000000; portfolio_calculation_enabled = $true } 15)
           Say "tester_execution_set_config" (Call "tester_execution_set_config" @{
@@ -250,8 +254,11 @@ jobs:
 
           # Regime defaults to On for this robot, but their own test sets it
           # explicitly and a silent Off is indistinguishable from a broken run.
+          # Exit on the 25th, not the 30th: the order is placed when that
+          # candle finishes and fills on the open of the next one, so the exit
+          # needs candles left after it.
           $prm = Payload (Call "bot_set_params" @{ bot_id = $botName
-            parameters = @{ "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = "2026-06-30" } } 21)
+            parameters = @{ "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = "2026-06-25" } } 21)
           if (-not $prm) { throw "bot_set_params refused" }
           Write-Host "parameters updated: $($prm.updated_count)"
 
@@ -316,6 +323,68 @@ jobs:
           Say "summary"    (Call "bot_journal_get_summary"          @{ bot_name = $botName } 40)
           Say "statistics" (Call "bot_journal_get_statistics"       @{ bot_name = $botName; side = "All" } 41)
           Say "closed"     (Call "bot_journal_get_closed_positions" @{ bot_name = $botName; include_failed = $false; limit = 100; offset = 0 } 42)
+
+          # 12. The arithmetic check. The answer was known before the tester ran.
+          #
+          # Two rules of this engine, both read out of its source rather than
+          # assumed. CheckCandles emits four synthetic trades per candle --
+          # open, high, low, close -- and only then raises the candle-finished
+          # event, so an order placed by a robot on candle N meets candle N+1
+          # and fills at its open. Position.CommissionTotal charges
+          # (entry + close) * value/100 -- Percent really is percent, and it is
+          # charged on both sides.
+          $rows = Get-Content (Join-Path $data "SBER") | ForEach-Object {
+            $f = $_.Split(","); [pscustomobject]@{ d = $f[0]; open = [decimal]$f[2] } }
+          function OpenAfter($yyyymmdd) {
+            $i = 0
+            while ($i -lt $rows.Count -and $rows[$i].d -le $yyyymmdd) { $i++ }
+            if ($i -ge $rows.Count) { throw "no candle after $yyyymmdd" }
+            return $rows[$i].open
+          }
+          $entry = OpenAfter "20240103"
+          $exit  = OpenAfter "20260625"
+          $expectedGross = $exit - $entry
+          $expectedFee   = ($entry + $exit) * 0.05 / 100
+          $expectedNet   = $expectedGross - $expectedFee
+
+          $closed = Payload (Call "bot_journal_get_closed_positions" @{
+            bot_name = $botName; include_failed = $false; limit = 100; offset = 0 } 43)
+          Write-Host ""
+          Write-Host "=== buy and hold: expected before the run ==="
+          Write-Host ("  entry {0}  exit {1}  gross {2}  fee {3}  net {4}" -f `
+            $entry, $exit, $expectedGross, [math]::Round($expectedFee, 5), [math]::Round($expectedNet, 5))
+          if (-not $closed -or $closed.count -eq 0) {
+            throw "no closed positions -- the robot ended holding, so nothing was measured"
+          }
+          if ($closed.count -ne 1) { throw "expected exactly 1 closed position, got $($closed.count)" }
+          $p = $closed.positions[0]
+          Write-Host "=== what the tester reported ==="
+          Write-Host ($p | ConvertTo-Json -Depth 6)
+
+          # profit_abs is ProfitPortfolioAbs, which subtracts CommissionTotal()
+          # already -- so it is the net figure, and comparing it against a gross
+          # expectation would fail by exactly the cost we are trying to check.
+          $problems = @()
+          if ([math]::Abs($p.entry_price - $entry) -gt 0.0001) {
+            $problems += "entry_price $($p.entry_price), expected $entry" }
+          if ([math]::Abs($p.close_price - $exit) -gt 0.0001) {
+            $problems += "close_price $($p.close_price), expected $exit" }
+          if ([math]::Abs($p.commission - $expectedFee) -gt 0.0001) {
+            $problems += "commission $($p.commission), expected $([math]::Round($expectedFee,5))" }
+          if ([math]::Abs($p.profit_abs - $expectedNet) -gt 0.01) {
+            $problems += "profit_abs $($p.profit_abs), expected $([math]::Round($expectedNet,5))" }
+
+          if ($problems.Count -gt 0) {
+            Write-Host "=== MISMATCH ==="
+            $problems | ForEach-Object { Write-Host "  $_" }
+            throw "buy and hold disagrees with its own arithmetic"
+          }
+          Write-Host "=== buy and hold agrees with arithmetic to the kopeck ==="
+
+          # The cost check rides along: zero commission on a round trip would
+          # pass every profit test and be wrong about every one of them.
+          if ($p.commission -le 0) { throw "commission was not charged on a completed round trip" }
+          Write-Host "=== costs were charged: $($p.commission) on a round trip ==="
 
       - name: Collect whatever it wrote down
         if: always()
