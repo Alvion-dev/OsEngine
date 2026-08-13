@@ -336,6 +336,13 @@ jobs:
             # When the count is far from what the robot's logic implies, the
             # timings say which of the two is wrong -- the robot or the engine.
             # Positions come back newest first, so the tail is the beginning.
+            # Полная выгрузка сделок в артефакт: сводкам верить нельзя, пока
+            # они не пересчитаны из самих сделок кем-то, кто их не считал.
+            $safe = ($botName -replace "[^A-Za-z0-9_.-]", "_")
+            $all | ConvertTo-Json -Depth 6 |
+              Set-Content "artifacts/positions_$safe.json" -Encoding utf8
+            Write-Host "    выгружено в artifacts/positions_$safe.json"
+
             $first = @($all | Sort-Object open_time | Select-Object -First 6)
             foreach ($q in $first) {
               Write-Host ("    #{0} {1} -> {2}  {3} {4} -> {5}" -f `
