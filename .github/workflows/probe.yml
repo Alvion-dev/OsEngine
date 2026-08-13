@@ -186,6 +186,70 @@ jobs:
             }
           }
 
+      - name: First real test — buy and hold, answer known in advance
+        if: env.MCP_ANSWERED == 'True'
+        shell: pwsh
+        run: |
+          function Call($name, $toolArgs, $id) {
+            $body = @{ jsonrpc = "2.0"; id = $id; method = "tools/call"
+                       params = @{ name = $name; arguments = $toolArgs } } | ConvertTo-Json -Depth 10
+            Write-Host ">>> $name $(($toolArgs | ConvertTo-Json -Compress))"
+            try {
+              $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
+                    -ContentType "application/json" -Body $body `
+                    -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 120
+              $r | ConvertTo-Json -Depth 30 | Set-Content "artifacts/run_$name$id.json" -Encoding utf8
+              if ($r.result.IsError) { Write-Host "    REFUSED: $($r.result.Content[0].Text)" }
+              else { Write-Host "    ok: $(($r.result.Content[0].Text))".Substring(0, [Math]::Min(300, "    ok: $(($r.result.Content[0].Text))".Length)) }
+              return $r
+            } catch {
+              Write-Host "    HTTP FAILURE $($_.Exception.Message)"
+              return $null
+            }
+          }
+
+          $data = Join-Path $env:GITHUB_WORKSPACE "project/OsEngine/Data/Calibration"
+          Write-Host "data folder: $data"
+          Get-ChildItem -Recurse $data | Select-Object FullName,Length | Format-Table
+
+          # Costs live on the robot tab, not in the tester. Setting them in the
+          # wrong place would make the cost check fail for the wrong reason.
+          Call "bot_create" @{ strategy_name = "CalibBuyAndHold"; name = "calibBH" } 30 | Out-Null
+          $src = Call "bot_get_sources" @{ bot_id = "calibBH" } 31
+          Call "bot_set_config_tab_simple" @{
+            bot_id = "calibBH"; tab_name = "Tab1"
+            server_type = "Tester"; portfolio_name = "GodMode"
+            security_class = "TestClass"; security_name = "SBER"
+            commission_type = "Percent"; commission_value = 0.05
+            time_frame = "Day"; events_is_on = $true
+          } 32 | Out-Null
+          Call "bot_set_params" @{ bot_id = "calibBH"
+            parameters = @{ "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = "2026-06-30" } } 33 | Out-Null
+
+          Call "tester_data_set_config" @{
+            source_type = "Folder"; folder_path = $data
+            type_tester_data = "Candle"
+            date_from = "2024-01-03"; date_to = "2026-06-30"
+          } 34 | Out-Null
+          Call "tester_portfolio_set_config" @{ start_portfolio = 1000000 } 35 | Out-Null
+          Call "tester_execution_set_config" @{ slippage_to_simple_order = 0; order_execution_type = "Touch" } 36 | Out-Null
+
+          Call "tester_start" @{ fast_forward = $true } 37 | Out-Null
+
+          # The tester runs asynchronously; poll rather than guess a duration.
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 10
+            $sum = Call "bot_journal_get_summary" @{ bot_name = "calibBH" } (400 + $i)
+            if ($sum -and -not $sum.result.IsError) {
+              $txt = $sum.result.Content[0].Text
+              if ($txt -match '"totalProfit"' -or $txt -match 'Profit') { Write-Host "    summary: $txt"; }
+            }
+          }
+
+          Call "bot_journal_get_closed_positions" @{ bot_name = "calibBH"; limit = 50 } 500 | Out-Null
+          Call "bot_journal_get_statistics" @{ bot_name = "calibBH" } 501 | Out-Null
+          Call "bot_journal_get_summary" @{ bot_name = "calibBH" } 502 | Out-Null
+
       - name: Collect whatever it wrote down
         if: always()
         shell: pwsh
