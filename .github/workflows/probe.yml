@@ -154,10 +154,13 @@ jobs:
           # daily bars in a dozen places -- one date per bar, "the next day"
           # meaning "the next bar" -- and every one of those would have quietly
           # produced a wrong expectation on minute data rather than an error.
-          $experiment = $true        # только опыт с разрывами, разделы 1-3 пропускаются
-          $dataFolder = "Gaps"       # подпапка calibration-data
-          $timeFrame  = "Min1"       # TimeFrame движка, должен совпадать с данными
-          $dateFrom   = "2026-06-01T00:00:00"
+          # Опыт с разрывами доказал своё и выключен; данные и код остались,
+          # включается одним флагом. По умолчанию — дневные, на них
+          # четвёрка зелёная.
+          $experiment = $false
+          $dataFolder = "Daily"      # подпапка calibration-data
+          $timeFrame  = "Day"        # TimeFrame движка, должен совпадать с данными
+          $dateFrom   = "2024-01-03T00:00:00"
           $dateTo     = "2026-07-01T00:00:00"
           $exitDate   = "20260625"   # день, на первом баре которого выходим
 
