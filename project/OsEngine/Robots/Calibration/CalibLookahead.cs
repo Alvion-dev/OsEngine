@@ -34,9 +34,10 @@ It cheats on OPENS, two candles ahead, and that detail is the whole exercise.
 An order placed when candle N finishes fills at the open of candle N+1 -- the
 engine emits open, high, low and close as trades and only then raises the
 candle-finished event, so the current candle's prices are already spent. This
-robot closes on the next candle it sees, which fills at the open of N+2.
-So what a long trade actually earns is open[N+2] - open[N+1], and that is the
-number it has to know in advance.
+robot cannot close on the next candle: the position is still Opening then and
+the request is swallowed. It closes one bar later, which fills at the open of
+N+3. So what a long trade actually earns is open[N+3] - open[N+1], and that is
+the number it has to know in advance.
 
 Peeking at closes instead -- the obvious thing to write -- would foresee a
 quantity the robot never trades. It would still make money, because closes and
@@ -226,14 +227,27 @@ namespace OsEngine.Robots.Calibration
                 }
             }
 
-            // Each candle is mapped to the NEXT TWO opens -- where an order
-            // placed now would be filled, and where it would be closed. The
-            // mapping is built here rather than at lookup time so a candle
-            // without two candles after it simply has no entry, instead of
-            // quietly falling back to a price that is not a fill.
-            for (int i = 0; i + 2 < times.Count; i++)
+            // Each candle is mapped to the two opens this robot will actually
+            // be filled at: entry and exit.
+            //
+            // Entry is open[i+1] -- an order placed when candle i finishes
+            // meets candle i+1 and takes its open.
+            //
+            // Exit is open[i+3], not open[i+2], and that extra bar is the whole
+            // correction. Closing takes two bars, not one: on the bar after the
+            // entry fills, the position is still Opening with no volume and the
+            // request is swallowed; only on the bar after that is it genuinely
+            // open, the request goes through, and the order takes the open of
+            // the following bar.
+            //
+            // The first version foresaw open[i+2] and was right while the robot
+            // closed on the very next candle it saw. Once the closing was
+            // corrected to what this engine requires, the foreseen pair stopped
+            // being the traded pair -- and the gross win rate fell from 100% to
+            // 76.7%, which is exactly what a yardstick is for.
+            for (int i = 0; i + 3 < times.Count; i++)
             {
-                _future[times[i]] = new[] { opens[i + 1], opens[i + 2] };
+                _future[times[i]] = new[] { opens[i + 1], opens[i + 3] };
             }
 
             _tab.SetNewLogMessage("Calibration: loaded " + _future.Count + " future fills",
