@@ -17,7 +17,7 @@ on:
 jobs:
   probe:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -148,6 +148,18 @@ jobs:
           # it is a different answer.
           $commissionPercent = 0.05
 
+          # --- what we are calibrating on -------------------------------
+          # Everything below is written to be timeframe-agnostic: the checks
+          # measure bars, not days. The first version of this file assumed
+          # daily bars in a dozen places -- one date per bar, "the next day"
+          # meaning "the next bar" -- and every one of those would have quietly
+          # produced a wrong expectation on minute data rather than an error.
+          $dataFolder = "Min1"       # подпапка calibration-data
+          $timeFrame  = "Min1"       # TimeFrame движка, должен совпадать с данными
+          $dateFrom   = "2026-06-01T00:00:00"
+          $dateTo     = "2026-07-01T00:00:00"
+          $exitDate   = "20260625"   # день, на первом баре которого выходим
+
           $script:callId = 0
           function Call($name, $toolArgs) {
             $script:callId++
@@ -214,7 +226,7 @@ jobs:
               server_type = "Tester"; portfolio_name = "GodMode"
               security_class = $script:securityClass; security_name = $script:securityName
               commission_type = "Percent"; commission_value = $commissionPercent
-              time_frame = "Day" })
+              time_frame = $timeFrame })
             if (-not $tab) { throw "bot_set_config_tab_simple refused for $name" }
             if ($tab.commission_value -ne $commissionPercent) {
               throw "$name : commission read back as $($tab.commission_value), asked for $commissionPercent"
@@ -311,14 +323,21 @@ jobs:
           # of the files loads nothing, the tester keeps TimeStart at
           # DateTime.MinValue, and TestingStart() returns before reaching Play.
           # That was the whole of the earlier "NotActive / 0001-01-01 / zero deals".
-          $src = Join-Path $env:GITHUB_WORKSPACE "calibration-data\Daily"
+          $src = Join-Path $env:GITHUB_WORKSPACE "calibration-data\$dataFolder"
           if (-not (Test-Path $src)) { throw "quotes folder $src is missing from the checkout" }
           $data = Join-Path $env:OSENGINE_DIR "CalibData"
           New-Item -ItemType Directory -Force -Path $data | Out-Null
           Copy-Item "$src\*" -Destination $data -Force
+
+          # `key` is date AND time. On daily bars the date alone identified a
+          # bar; on minute bars eight hundred bars share a date, so every
+          # lookup below matches the full stamp. This is the single change that
+          # makes the rest of the file timeframe-agnostic.
           $rows = @(Get-Content (Join-Path $data "SBER") | ForEach-Object {
-            $f = $_.Split(","); [pscustomobject]@{ d = $f[0]; open = [decimal]$f[2]; close = [decimal]$f[5] } })
-          Write-Host "quotes: $($rows.Count) daily candles, $($rows[0].d)..$($rows[-1].d)"
+            $f = $_.Split(",")
+            [pscustomobject]@{
+              key = $f[0] + $f[1]; d = $f[0]; open = [decimal]$f[2]; close = [decimal]$f[5] } })
+          Write-Host "quotes: $($rows.Count) candles ($timeFrame), $($rows[0].key)..$($rows[-1].key)"
 
           # The noise band for the random-entry check is measured here, not
           # guessed. A guessed volatility makes the band wrong in an unknown
@@ -362,7 +381,7 @@ jobs:
           # the last candle -- LoadNextData pauses the moment TimeNow passes
           # TimeEnd, and the candles carry a 10:00 stamp.
           Say "dates" (Call "tester_data_set_config" @{
-            date_from = "2024-01-03T00:00:00"; date_to = "2026-07-01T00:00:00" })
+            date_from = $dateFrom; date_to = $dateTo })
           Say "portfolio" (Call "tester_portfolio_set_config" @{
             start_portfolio = 1000000; portfolio_calculation_enabled = $true })
           Say "execution" (Call "tester_execution_set_config" @{
@@ -377,7 +396,6 @@ jobs:
           # ===============================================================
           Write-Host ""
           Write-Host "=== 1. BUY AND HOLD ==="
-          $exitDate = "20260625"
           $exitDashed = ([datetime]::ParseExact($exitDate, "yyyyMMdd", $null)).ToString("yyyy-MM-dd")
           $bh = NewCalibBot "CalibBuyAndHold" @{
             "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = $exitDashed }
@@ -393,23 +411,40 @@ jobs:
             #   a) a fill happens at the OPEN of a candle -- CheckCandles emits
             #      open/high/low/close as trades, then raises candle-finished;
             #   b) so an order placed on candle N fills on candle N+1. Checked
-            #      on the exit, whose date we chose;
+            #      on the exit, whose trigger bar we can locate exactly;
             #   c) commission is (entry + close) * rate, both sides.
-            # The entry is deliberately not pinned to a candle we picked: the
-            # first candle of the series warms it up and never reaches the
-            # robot, so counting from the file would encode a guess.
-            $openDay  = ([datetime]$p.open_time).ToString("yyyyMMdd")
-            $closeDay = ([datetime]$p.close_time).ToString("yyyyMMdd")
-            $expEntry = ($rows | Where-Object { $_.d -eq $openDay }).open
-            $expExit  = ($rows | Where-Object { $_.d -eq $closeDay }).open
-            $shouldCloseOn = ($rows | Where-Object { $_.d -gt $exitDate } | Select-Object -First 1).d
+            # The entry is deliberately not pinned to a bar we picked: the first
+            # bar of the series warms it up and never reaches the robot, so
+            # counting from the file would encode a guess about warm-up.
+            $openKey  = ([datetime]$p.open_time).ToString("yyyyMMddHHmmss")
+            $closeKey = ([datetime]$p.close_time).ToString("yyyyMMddHHmmss")
+            $expEntry = ($rows | Where-Object { $_.key -eq $openKey }).open
+            $expExit  = ($rows | Where-Object { $_.key -eq $closeKey }).open
 
-            if ($closeDay -ne $shouldCloseOn) {
-              $failures += "buy and hold: closed on $closeDay; an order placed when $exitDate finished must fill on $shouldCloseOn" }
-            if ([math]::Abs($p.entry_price - $expEntry) -gt 0.0001) {
-              $failures += "buy and hold: entry_price $($p.entry_price) is not the open of $openDay ($expEntry)" }
-            if ([math]::Abs($p.close_price - $expExit) -gt 0.0001) {
-              $failures += "buy and hold: close_price $($p.close_price) is not the open of $closeDay ($expExit)" }
+            # "The next bar", not "the next day". On daily data these coincide,
+            # which is why the day-based version passed; on minute data the
+            # robot exits on the first bar of the exit date and fills one
+            # minute later, still inside that same date.
+            $trigger = -1
+            for ($i = 0; $i -lt $rows.Count; $i++) {
+              if ($rows[$i].d -ge $exitDate) { $trigger = $i; break }
+            }
+            if ($trigger -lt 0 -or $trigger + 1 -ge $rows.Count) {
+              $failures += "buy and hold: exit date $exitDate leaves no bar to fill on"
+            } else {
+              $shouldCloseKey = $rows[$trigger + 1].key
+              if ($closeKey -ne $shouldCloseKey) {
+                $failures += "buy and hold: closed on $closeKey; an order placed when bar $($rows[$trigger].key) finished must fill on $shouldCloseKey" }
+            }
+
+            if ($null -eq $expEntry) {
+              $failures += "buy and hold: entry stamped $openKey, which is not a bar in the file" }
+            elseif ([math]::Abs($p.entry_price - $expEntry) -gt 0.0001) {
+              $failures += "buy and hold: entry_price $($p.entry_price) is not the open of $openKey ($expEntry)" }
+            if ($null -eq $expExit) {
+              $failures += "buy and hold: exit stamped $closeKey, which is not a bar in the file" }
+            elseif ([math]::Abs($p.close_price - $expExit) -gt 0.0001) {
+              $failures += "buy and hold: close_price $($p.close_price) is not the open of $closeKey ($expExit)" }
 
             $r = CheckEveryPosition $bhPositions
             $failures += $r.problems | ForEach-Object { "buy and hold: $_" }
@@ -431,7 +466,10 @@ jobs:
           # "unremarkable" and "worth checking" depending on which story you
           # already believe. Across seeds the two stories separate -- chance
           # scatters around zero, a tilt lands on the same side every time.
-          $seeds = @(20260812, 1, 7, 42, 1917, 31337, 90210, 271828)
+          # Four, not eight: on minute bars each run makes thousands of
+          # trades instead of three hundred, so the noise band narrows on
+          # its own and the runs cost real minutes each.
+          $seeds = @(20260812, 1, 7, 42)
           $results = @()
           $previousBot = $bh
 
@@ -506,7 +544,7 @@ jobs:
           # The coin-flip spread is the yardstick below. If section 2 did not
           # produce it, fall back to the same formula on the trade count this
           # robot will make, rather than dividing by nothing later.
-          if (-not $runSd) { $runSd = $moveSd * [math]::Sqrt(315) }
+          if (-not $runSd) { $runSd = $moveSd * [math]::Sqrt($rows.Count / 2) }
           $futureFile = Join-Path $env:OSENGINE_DIR "calib-future.csv"
           if (Test-Path $futureFile) { Remove-Item $futureFile -Force }
 
