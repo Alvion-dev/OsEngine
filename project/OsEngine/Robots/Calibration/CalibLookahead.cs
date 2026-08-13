@@ -11,10 +11,9 @@ using OsEngine.OsTrader.Panels.Tab;
 Calibration robot. Not a strategy -- a measuring instrument, and a deliberately
 broken one.
 
-It buys when tomorrow closes higher than today and sells when it closes lower.
-That is impossible, and the point is to see what impossible looks like in this
-engine's own statistics. Without that yardstick there is nothing to compare a
-suspiciously good result against later.
+It trades knowing the future, which is impossible, so that we can see what
+impossible looks like in this engine's own statistics. Without that yardstick
+there is nothing to compare a suspiciously good result against later.
 
 Getting the future in took a detour worth recording. OsEngine hands a robot only
 the candles up to now: CandleFinishedEvent receives a List<Candle> that ends at
@@ -24,12 +23,27 @@ finding about the engine, made before any test was run.
 
 So the future is smuggled in over two passes:
 
-  Regime = Record  -- trades nothing, writes the closes it sees to a file.
+  Regime = Record  -- trades nothing, writes the opens it sees to a file.
   Regime = Cheat   -- reads that file back and trades knowing what comes next.
 
 Two passes rather than reading OsEngine's own data files, because that would
 require knowing their format and would break whenever the format changed. The
 robot writes what it needs itself, in the shape it needs.
+
+It cheats on OPENS, two candles ahead, and that detail is the whole exercise.
+An order placed when candle N finishes fills at the open of candle N+1 -- the
+engine emits open, high, low and close as trades and only then raises the
+candle-finished event, so the current candle's prices are already spent. This
+robot closes on the next candle it sees, which fills at the open of N+2.
+So what a long trade actually earns is open[N+2] - open[N+1], and that is the
+number it has to know in advance.
+
+Peeking at closes instead -- the obvious thing to write -- would foresee a
+quantity the robot never trades. It would still make money, because closes and
+opens move together, but it would win maybe seven trades in ten. Reading that as
+"the engine hides the future from a robot that is openly cheating" would be
+exactly backwards, and would have quietly weakened every later check that leans
+on this yardstick.
 
 If the Cheat pass does NOT produce absurd numbers, something is wrong with the
 experiment or with the engine, and either way it has to be understood before any
@@ -47,7 +61,9 @@ namespace OsEngine.Robots.Calibration
         private StrategyParameterDecimal _volume;
         private StrategyParameterString _fileName;
 
-        private readonly Dictionary<DateTime, decimal> _future = new Dictionary<DateTime, decimal>();
+        // candle time -> the two opens that a trade opened on that candle will
+        // actually be filled at: entry at the first, exit at the second.
+        private readonly Dictionary<DateTime, decimal[]> _future = new Dictionary<DateTime, decimal[]>();
         private readonly List<string> _recorded = new List<string>();
         private bool _futureLoaded;
 
@@ -103,7 +119,7 @@ namespace OsEngine.Robots.Calibration
             _recorded.Add(
                 current.TimeStart.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
                 + ";"
-                + current.Close.ToString(CultureInfo.InvariantCulture));
+                + current.Open.ToString(CultureInfo.InvariantCulture));
 
             // Written on every candle rather than at the end: a backtest gives
             // no "we are finished" moment, and a file that is only flushed on
@@ -128,23 +144,29 @@ namespace OsEngine.Robots.Calibration
                 return;
             }
 
-            decimal tomorrow;
-            if (_future.TryGetValue(current.TimeStart, out tomorrow) == false)
-            {
-                return;
-            }
-
+            // Close first and return: the position opened on the previous candle
+            // is exited here, and its exit is the second of the two opens that
+            // were looked up when it was opened.
             if (_tab.PositionsOpenAll.Count > 0)
             {
                 _tab.CloseAllAtMarket();
                 return;
             }
 
-            if (tomorrow > current.Close)
+            decimal[] fills;
+            if (_future.TryGetValue(current.TimeStart, out fills) == false)
+            {
+                return;
+            }
+
+            decimal entry = fills[0];
+            decimal exit = fills[1];
+
+            if (exit > entry)
             {
                 _tab.BuyAtMarket(_volume.ValueDecimal);
             }
-            else if (tomorrow < current.Close)
+            else if (exit < entry)
             {
                 _tab.SellAtMarket(_volume.ValueDecimal);
             }
@@ -167,7 +189,7 @@ namespace OsEngine.Robots.Calibration
 
             string[] lines = File.ReadAllLines(FilePath);
             var times = new List<DateTime>();
-            var closes = new List<decimal>();
+            var opens = new List<decimal>();
 
             for (int i = 0; i < lines.Length; i++)
             {
@@ -177,27 +199,28 @@ namespace OsEngine.Robots.Calibration
                     continue;
                 }
                 DateTime time;
-                decimal close;
+                decimal open;
                 if (DateTime.TryParseExact(parts[0], "yyyy-MM-dd HH:mm:ss",
                         CultureInfo.InvariantCulture, DateTimeStyles.None, out time)
                     && decimal.TryParse(parts[1], NumberStyles.Any,
-                        CultureInfo.InvariantCulture, out close))
+                        CultureInfo.InvariantCulture, out open))
                 {
                     times.Add(time);
-                    closes.Add(close);
+                    opens.Add(open);
                 }
             }
 
-            // Each candle is mapped to the NEXT candle's close. That mapping is
-            // the whole cheat, and it is built here rather than at lookup time
-            // so a missing tomorrow simply has no entry instead of quietly
-            // returning today's own close.
-            for (int i = 0; i + 1 < times.Count; i++)
+            // Each candle is mapped to the NEXT TWO opens -- where an order
+            // placed now would be filled, and where it would be closed. The
+            // mapping is built here rather than at lookup time so a candle
+            // without two candles after it simply has no entry, instead of
+            // quietly falling back to a price that is not a fill.
+            for (int i = 0; i + 2 < times.Count; i++)
             {
-                _future[times[i]] = closes[i + 1];
+                _future[times[i]] = new[] { opens[i + 1], opens[i + 2] };
             }
 
-            _tab.SetNewLogMessage("Calibration: loaded " + _future.Count + " future closes",
+            _tab.SetNewLogMessage("Calibration: loaded " + _future.Count + " future fills",
                 Logging.LogMessageType.System);
         }
     }

@@ -496,6 +496,87 @@ jobs:
           }
 
           # ===============================================================
+          # 3. Lookahead. A robot that is openly cheating must produce numbers
+          #    nobody could reach honestly. If it does not, the yardstick is
+          #    broken and every later "this looks too good" has nothing to be
+          #    measured against.
+          # ===============================================================
+          Write-Host ""
+          Write-Host "=== 3. LOOKAHEAD ==="
+          $futureFile = Join-Path $env:OSENGINE_DIR "calib-future.csv"
+          if (Test-Path $futureFile) { Remove-Item $futureFile -Force }
+
+          # Pass one records; it trades nothing.
+          Call "tester_stop" @{} | Out-Null
+          Call "bot_delete" @{ bot_id = $previousBot } | Out-Null
+          WaitTesterServer
+          $rec = NewCalibBot "CalibLookahead" @{
+            "Regime" = "Record"; "Volume" = 1; "File" = "calib-future.csv" }
+          RunTester
+          if (-not (Test-Path $futureFile)) {
+            $failures += "lookahead: the Record pass wrote no file at $futureFile"
+          } else {
+            $recorded = @(Get-Content $futureFile)
+            Write-Host "  recorded $($recorded.Count) candles the robot actually saw"
+            $recPositions = ClosedPositions $rec
+            if ($recPositions.Count -ne 0) {
+              $failures += "lookahead: the Record pass traded $($recPositions.Count) times; it is supposed to only watch"
+            }
+
+            # Pass two trades on it.
+            Call "tester_stop" @{} | Out-Null
+            Call "bot_delete" @{ bot_id = $rec } | Out-Null
+            WaitTesterServer
+            $che = NewCalibBot "CalibLookahead" @{
+              "Regime" = "Cheat"; "Volume" = 1; "File" = "calib-future.csv" }
+            RunTester
+            $chePositions = ClosedPositions $che
+            Write-Host "  closed positions: $($chePositions.Count)"
+
+            if ($chePositions.Count -lt 100) {
+              $failures += "lookahead: only $($chePositions.Count) trades -- the Cheat pass did not read the future back"
+            } else {
+              $r = CheckEveryPosition $chePositions
+              $failures += $r.problems | ForEach-Object { "lookahead: $_" }
+
+              # Win rate is the honest signal here: it is scale-free, so it does
+              # not depend on position size or on what fraction of the portfolio
+              # was deployed. Perfect foresight of its own fills should win
+              # essentially every trade that moved at all.
+              $winners = @($chePositions | Where-Object { $_.profit_abs -gt 0 }).Count
+              $winRate = $winners / $chePositions.Count
+
+              # Return is quoted on the capital actually at risk -- one share at
+              # a time -- not on the 1M portfolio, where one share of SBER would
+              # round to nothing and hide the absurdity we are looking for.
+              $avgEntry = ($chePositions | ForEach-Object { [double]$_.entry_price } | Measure-Object -Average).Average
+              $years = ([datetime]$chePositions[-1].close_time - [datetime]$chePositions[0].open_time).Days / 365.25
+              $annualPct = ($r.net / $avgEntry) * 100 / $years
+
+              Write-Host ("  gross {0}  fee {1}  net {2}" -f `
+                [math]::Round($r.gross,2), [math]::Round($r.fee,2), [math]::Round($r.net,2))
+              Write-Host ("  win rate {0}%  ({1} of {2})" -f `
+                [math]::Round($winRate * 100, 1), $winners, $chePositions.Count)
+              Write-Host ("  on capital at risk ({0} RUB a trade): {1}% a year over {2} years" -f `
+                [math]::Round($avgEntry,2), [math]::Round($annualPct,1), [math]::Round($years,2))
+
+              # The thresholds are the ones the Python harness already uses:
+              # a 90% win rate or 200% a year is not a strategy, it is a leak.
+              if ($winRate -lt 0.90) {
+                $failures += ("lookahead: win rate only {0}% -- a robot reading its own future should win nearly everything, so either the cheat is not landing or the engine is doing something to the signal" -f `
+                  [math]::Round($winRate * 100, 1))
+              }
+              if ($annualPct -lt 200) {
+                $failures += ("lookahead: only {0}% a year on capital at risk -- too modest for perfect foresight to be a usable yardstick" -f `
+                  [math]::Round($annualPct, 1))
+              }
+              if ($failures.Count -eq 0) {
+                Write-Host "  impossible numbers reached -- the engine does NOT hide a leak of this size"
+              }
+            }
+          }
+
+          # ===============================================================
           Write-Host ""
           if ($failures.Count -gt 0) {
             Write-Host "=== FAILURES ==="
