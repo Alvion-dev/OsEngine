@@ -1677,8 +1677,11 @@ namespace OsEngine.MCP.Modules
                 server_full_name = connector.ServerFullName,
                 portfolio_name = connector.PortfolioName,
                 emulator_is_on = connector.EmulatorIsOn,
-                commission_type = connector.CommissionType.ToString(),
-                commission_value = connector.CommissionValue,
+                // Read back from the same place it is written: the tab, whose
+                // getter reads the journal. Reading the connector reported a
+                // commission that the journal had never heard of.
+                commission_type = tab.CommissionType.ToString(),
+                commission_value = tab.CommissionValue,
                 security_class = connector.SecurityClass,
                 security_name = connector.SecurityName,
                 events_is_on = connector.EventsIsOn,
@@ -1756,18 +1759,29 @@ namespace OsEngine.MCP.Modules
                 connector.EmulatorIsOn = emulatorIsOnElement.GetBoolean();
             }
 
+            // Through the tab, not the connector. The commission has to reach
+            // the journal, because PositionController stamps it onto every
+            // position it opens and Position.CommissionTotal() returns zero
+            // without it. BotTabSimple's setter writes both the journal and the
+            // connector; writing the connector alone reaches only half of them.
+            //
+            // The connector's own value used to be copied across in exactly one
+            // place, _connector_DialogClosed -- which fires when a person closes
+            // the settings window. With no window there is no copy, so a backtest
+            // driven over MCP charged nothing while reporting the commission back
+            // as if it had been applied.
             if (parameters.TryGetProperty("commission_type", out JsonElement commissionTypeElement)
                 && commissionTypeElement.ValueKind == JsonValueKind.String
                 && Enum.TryParse<CommissionType>(commissionTypeElement.GetString(), true, out CommissionType commissionType))
             {
-                connector.CommissionType = commissionType;
+                tab.CommissionType = commissionType;
             }
 
             if (parameters.TryGetProperty("commission_value", out JsonElement commissionValueElement)
                 && commissionValueElement.ValueKind == JsonValueKind.Number
                 && commissionValueElement.TryGetDecimal(out decimal commissionValue))
             {
-                connector.CommissionValue = commissionValue;
+                tab.CommissionValue = commissionValue;
             }
 
             if (parameters.TryGetProperty("events_is_on", out JsonElement eventsIsOnElement)

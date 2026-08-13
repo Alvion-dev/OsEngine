@@ -143,6 +143,14 @@ jobs:
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
 
+          # Sergey's actual tariff, 0.05% of turnover, confirmed 2026-08-13.
+          # A backtest run on a made-up commission is not a cheap approximation,
+          # it is a different answer.
+          $commissionPercent = 0.05
+          # The exit is placed when this candle finishes and fills on the next
+          # one, so it must not be the last day of the series.
+          $exitDate = "20260625"
+
           function Call($name, $toolArgs, $id) {
             $body = @{ jsonrpc = "2.0"; id = $id; method = "tools/call"
                        params = @{ name = $name; arguments = $toolArgs } } | ConvertTo-Json -Depth 10
@@ -254,11 +262,9 @@ jobs:
 
           # Regime defaults to On for this robot, but their own test sets it
           # explicitly and a silent Off is indistinguishable from a broken run.
-          # Exit on the 25th, not the 30th: the order is placed when that
-          # candle finishes and fills on the open of the next one, so the exit
-          # needs candles left after it.
+          $exitDateDashed = ([datetime]::ParseExact($exitDate, "yyyyMMdd", $null)).ToString("yyyy-MM-dd")
           $prm = Payload (Call "bot_set_params" @{ bot_id = $botName
-            parameters = @{ "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = "2026-06-25" } } 21)
+            parameters = @{ "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = $exitDateDashed } } 21)
           if (-not $prm) { throw "bot_set_params refused" }
           Write-Host "parameters updated: $($prm.updated_count)"
 
@@ -273,7 +279,7 @@ jobs:
             bot_id = $botName; tab_name = $tabName
             server_type = "Tester"; portfolio_name = "GodMode"
             security_class = $securityClass; security_name = $securityName
-            commission_type = "Percent"; commission_value = 0.05
+            commission_type = "Percent"; commission_value = $commissionPercent
             time_frame = "Day" } 23)
           if (-not $tab) { throw "bot_set_config_tab_simple refused" }
           Write-Host "tab bound to $($tab.security_name), commission $($tab.commission_type) $($tab.commission_value)"
@@ -324,51 +330,72 @@ jobs:
           Say "statistics" (Call "bot_journal_get_statistics"       @{ bot_name = $botName; side = "All" } 41)
           Say "closed"     (Call "bot_journal_get_closed_positions" @{ bot_name = $botName; include_failed = $false; limit = 100; offset = 0 } 42)
 
-          # 12. The arithmetic check. The answer was known before the tester ran.
+          # 12. The arithmetic check, against the quotes rather than against the
+          # tester's own summary.
           #
-          # Two rules of this engine, both read out of its source rather than
-          # assumed. CheckCandles emits four synthetic trades per candle --
-          # open, high, low, close -- and only then raises the candle-finished
-          # event, so an order placed by a robot on candle N meets candle N+1
-          # and fills at its open. Position.CommissionTotal charges
-          # (entry + close) * value/100 -- Percent really is percent, and it is
-          # charged on both sides.
-          $rows = Get-Content (Join-Path $data "SBER") | ForEach-Object {
-            $f = $_.Split(","); [pscustomobject]@{ d = $f[0]; open = [decimal]$f[2] } }
-          function OpenAfter($yyyymmdd) {
-            $i = 0
-            while ($i -lt $rows.Count -and $rows[$i].d -le $yyyymmdd) { $i++ }
-            if ($i -ge $rows.Count) { throw "no candle after $yyyymmdd" }
-            return $rows[$i].open
+          # Three claims, each read out of the engine's source rather than
+          # assumed, and each checked separately:
+          #
+          #   a) a fill happens at the OPEN of a candle. CheckCandles emits four
+          #      synthetic trades per candle -- open, high, low, close -- and
+          #      only then raises the candle-finished event.
+          #   b) an order placed when candle N finishes therefore fills on
+          #      candle N+1. Checked on the exit, whose date we chose.
+          #   c) Position.CommissionTotal charges (entry + close) * value/100.
+          #      Percent really is percent and it is taken on both sides.
+          #
+          # The entry is deliberately NOT pinned to a candle we picked: the first
+          # candle of the series is spent warming it up and never reaches the
+          # robot, so counting from the file would encode a guess about warm-up.
+          # Pinning it to the candle the engine itself stamps as open_time still
+          # catches a fill at a price that is not any open.
+          $rows = @(Get-Content (Join-Path $data "SBER") | ForEach-Object {
+            $f = $_.Split(","); [pscustomobject]@{ d = $f[0]; open = [decimal]$f[2] } })
+          function OpenOn($yyyymmdd) {
+            $row = $rows | Where-Object { $_.d -eq $yyyymmdd } | Select-Object -First 1
+            if (-not $row) { throw "no candle dated $yyyymmdd" }
+            return $row.open
           }
-          $entry = OpenAfter "20240103"
-          $exit  = OpenAfter "20260625"
-          $expectedGross = $exit - $entry
-          $expectedFee   = ($entry + $exit) * 0.05 / 100
-          $expectedNet   = $expectedGross - $expectedFee
+          function FirstDateAfter($yyyymmdd) {
+            $row = $rows | Where-Object { $_.d -gt $yyyymmdd } | Select-Object -First 1
+            if (-not $row) { throw "no candle after $yyyymmdd" }
+            return $row.d
+          }
 
           $closed = Payload (Call "bot_journal_get_closed_positions" @{
             bot_name = $botName; include_failed = $false; limit = 100; offset = 0 } 43)
-          Write-Host ""
-          Write-Host "=== buy and hold: expected before the run ==="
-          Write-Host ("  entry {0}  exit {1}  gross {2}  fee {3}  net {4}" -f `
-            $entry, $exit, $expectedGross, [math]::Round($expectedFee, 5), [math]::Round($expectedNet, 5))
           if (-not $closed -or $closed.count -eq 0) {
             throw "no closed positions -- the robot ended holding, so nothing was measured"
           }
           if ($closed.count -ne 1) { throw "expected exactly 1 closed position, got $($closed.count)" }
           $p = $closed.positions[0]
+          Write-Host ""
           Write-Host "=== what the tester reported ==="
           Write-Host ($p | ConvertTo-Json -Depth 6)
 
-          # profit_abs is ProfitPortfolioAbs, which subtracts CommissionTotal()
-          # already -- so it is the net figure, and comparing it against a gross
-          # expectation would fail by exactly the cost we are trying to check.
+          $openDay  = ([datetime]$p.open_time).ToString("yyyyMMdd")
+          $closeDay = ([datetime]$p.close_time).ToString("yyyyMMdd")
+          $expectedEntry = OpenOn $openDay
+          $expectedExit  = OpenOn $closeDay
+          $expectedFee   = ($expectedEntry + $expectedExit) * $commissionPercent / 100
+          $expectedNet   = ($expectedExit - $expectedEntry) * $p.volume - $expectedFee
+          $exitShouldBe  = FirstDateAfter $exitDate
+
+          Write-Host "=== what the quotes say it must be ==="
+          Write-Host ("  entry {0} on {1}   exit {2} on {3}   fee {4}   net {5}" -f `
+            $expectedEntry, $openDay, $expectedExit, $closeDay,
+            [math]::Round($expectedFee, 5), [math]::Round($expectedNet, 5))
+
+          # profit_abs is ProfitPortfolioAbs, which already subtracts
+          # CommissionTotal() -- comparing it against a gross expectation would
+          # fail by exactly the cost we are here to check.
           $problems = @()
-          if ([math]::Abs($p.entry_price - $entry) -gt 0.0001) {
-            $problems += "entry_price $($p.entry_price), expected $entry" }
-          if ([math]::Abs($p.close_price - $exit) -gt 0.0001) {
-            $problems += "close_price $($p.close_price), expected $exit" }
+          if ($closeDay -ne $exitShouldBe) {
+            $problems += "closed on $closeDay; an order placed when $exitDate finished must fill on $exitShouldBe" }
+          if ([math]::Abs($p.entry_price - $expectedEntry) -gt 0.0001) {
+            $problems += "entry_price $($p.entry_price) is not the open of $openDay ($expectedEntry)" }
+          if ([math]::Abs($p.close_price - $expectedExit) -gt 0.0001) {
+            $problems += "close_price $($p.close_price) is not the open of $closeDay ($expectedExit)" }
           if ([math]::Abs($p.commission - $expectedFee) -gt 0.0001) {
             $problems += "commission $($p.commission), expected $([math]::Round($expectedFee,5))" }
           if ([math]::Abs($p.profit_abs - $expectedNet) -gt 0.01) {
@@ -382,7 +409,9 @@ jobs:
           Write-Host "=== buy and hold agrees with arithmetic to the kopeck ==="
 
           # The cost check rides along: zero commission on a round trip would
-          # pass every profit test and be wrong about every one of them.
+          # pass every profit test and be wrong about every one of them. It is
+          # not hypothetical -- this is what the engine did before the fix in
+          # RobotsApi.ApplyBotConfigTabSimple.
           if ($p.commission -le 0) { throw "commission was not charged on a completed round trip" }
           Write-Host "=== costs were charged: $($p.commission) on a round trip ==="
 
