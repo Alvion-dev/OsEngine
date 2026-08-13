@@ -283,12 +283,15 @@ jobs:
           function CheckEveryPosition($positions) {
             $problems = @()
             $sumGross = 0.0; $sumFee = 0.0; $sumNet = 0.0
+            $grossLong = 0.0; $grossShort = 0.0; $longs = 0; $shorts = 0
             foreach ($p in $positions) {
               $fee = ($p.entry_price + $p.close_price) * $p.volume * $commissionPercent / 100
               $gross = if ($p.direction -eq "Long") { ($p.close_price - $p.entry_price) * $p.volume }
                        else { ($p.entry_price - $p.close_price) * $p.volume }
               $net = $gross - $fee
               $sumGross += [double]$gross; $sumFee += [double]$fee; $sumNet += [double]$net
+              if ($p.direction -eq "Long") { $grossLong += [double]$gross; $longs++ }
+              else { $grossShort += [double]$gross; $shorts++ }
 
               if ([math]::Abs($p.commission - $fee) -gt 0.0001) {
                 $problems += "position $($p.number): commission $($p.commission), expected $([math]::Round($fee,5))" }
@@ -297,7 +300,9 @@ jobs:
               if ($problems.Count -ge 5) { break }
             }
             return [pscustomobject]@{
-              problems = $problems; gross = $sumGross; fee = $sumFee; net = $sumNet }
+              problems = $problems; gross = $sumGross; fee = $sumFee; net = $sumNet
+              grossLong = $grossLong; grossShort = $grossShort
+              longs = $longs; shorts = $shorts; count = $positions.Count }
           }
 
           # ---------------------------------------------------------------
@@ -314,6 +319,16 @@ jobs:
           $rows = @(Get-Content (Join-Path $data "SBER") | ForEach-Object {
             $f = $_.Split(","); [pscustomobject]@{ d = $f[0]; open = [decimal]$f[2]; close = [decimal]$f[5] } })
           Write-Host "quotes: $($rows.Count) daily candles, $($rows[0].d)..$($rows[-1].d)"
+
+          # The noise band for the random-entry check is measured here, not
+          # guessed. A guessed volatility makes the band wrong in an unknown
+          # direction, which turns "outside the band" into a statement about
+          # the guess rather than about the engine.
+          $moves = @(for ($i = 1; $i -lt $rows.Count; $i++) { [double]($rows[$i].open - $rows[$i-1].open) })
+          $moveStats = $moves | Measure-Object -Average -StandardDeviation
+          $moveSd = $moveStats.StandardDeviation
+          Write-Host ("open-to-open move: mean {0} RUB, sd {1} RUB" -f `
+            [math]::Round($moveStats.Average,4), [math]::Round($moveSd,4))
 
           # Open the tester inside the running window. terminal_launch restarts
           # the process; the tester server then never comes up.
@@ -409,46 +424,75 @@ jobs:
           # ===============================================================
           Write-Host ""
           Write-Host "=== 2. RANDOM ENTRY ==="
-          Call "tester_stop" @{} | Out-Null
-          Call "bot_delete" @{ bot_id = $bh } | Out-Null
-          WaitTesterServer
 
-          # Enter every candle, hold one: the shortest cycle this data allows,
-          # which is what maximises the trade count on 633 daily candles.
-          $re = NewCalibBot "CalibRandomEntry" @{
-            "Regime" = "On"; "Volume" = 1; "Seed" = 20260812
-            "Hold candles" = 1; "Try entry every N candles" = 1 }
-          RunTester
-          $rePositions = ClosedPositions $re
-          Write-Host "  closed positions: $($rePositions.Count)"
-          if ($rePositions.Count -lt 100) {
-            $failures += "random entry: only $($rePositions.Count) trades -- too few for the costs to show above price noise"
-          } else {
-            $r = CheckEveryPosition $rePositions
-            $failures += $r.problems | ForEach-Object { "random entry: $_" }
+          # Run several seeds rather than one. A single run cannot tell chance
+          # from a systematic tilt in the engine: the first attempt came out
+          # +142.77 gross, 1.94 standard deviations above zero, which is both
+          # "unremarkable" and "worth checking" depending on which story you
+          # already believe. Across seeds the two stories separate -- chance
+          # scatters around zero, a tilt lands on the same side every time.
+          $seeds = @(20260812, 1, 7, 42, 1917, 31337, 90210, 271828)
+          $results = @()
+          $previousBot = $bh
 
-            $longs  = @($rePositions | Where-Object { $_.direction -eq "Long" }).Count
-            $shorts = @($rePositions | Where-Object { $_.direction -eq "Short" }).Count
-            Write-Host "  long $longs / short $shorts"
-            Write-Host ("  gross {0}  fee {1}  net {2}" -f `
-              [math]::Round($r.gross,2), [math]::Round($r.fee,2), [math]::Round($r.net,2))
+          foreach ($seed in $seeds) {
+            Call "tester_stop" @{} | Out-Null
+            Call "bot_delete" @{ bot_id = $previousBot } | Out-Null
+            WaitTesterServer
 
-            if ($r.fee -le 0) {
-              $failures += "random entry: $($rePositions.Count) round trips and no commission at all"
+            # Enter every candle, hold one: the shortest cycle this data allows,
+            # which is what maximises the trade count on 633 daily candles.
+            $re = NewCalibBot "CalibRandomEntry" @{
+              "Regime" = "On"; "Volume" = 1; "Seed" = $seed
+              "Hold candles" = 1; "Try entry every N candles" = 1 }
+            $previousBot = $re
+            RunTester
+            $rePositions = ClosedPositions $re
+
+            if ($rePositions.Count -lt 100) {
+              $failures += "random entry seed ${seed}: only $($rePositions.Count) trades -- too few for costs to show above price noise"
+              continue
             }
 
-            # The statistical claim, reported rather than asserted. A coin flip
-            # on daily candles carries about 2% of price noise per trade, so the
-            # sum of gross results is uncertain by roughly that times sqrt(N)
-            # times the price -- of the same order as the fee being measured.
-            # Asserting it here would be a coin toss dressed as a check.
-            $avgPrice = ($rePositions | ForEach-Object { [double]$_.entry_price } | Measure-Object -Average).Average
-            $noise = 0.02 * $avgPrice * [math]::Sqrt($rePositions.Count)
-            Write-Host ("  gross is {0} against a noise band of about +/-{1} -- {2}" -f `
-              [math]::Round($r.gross,2), [math]::Round($noise,2),
-              $(if ([math]::Abs($r.gross) -le $noise) { "consistent with no edge" } else { "OUTSIDE the band, worth reading twice" }))
-            Write-Host ("  costs ate {0} on {1} round trips, {2} per trade" -f `
-              [math]::Round($r.fee,2), $rePositions.Count, [math]::Round($r.fee / $rePositions.Count, 4))
+            $r = CheckEveryPosition $rePositions
+            $failures += $r.problems | ForEach-Object { "random entry seed ${seed}: $_" }
+            if ($r.fee -le 0) {
+              $failures += "random entry seed ${seed}: $($rePositions.Count) round trips and no commission at all"
+            }
+            $results += $r
+            Write-Host ("  seed {0,-8} trades {1,4}  long/short {2}/{3}  gross {4,8}  fee {5,7}  net {6,8}" -f `
+              $seed, $r.count, $r.longs, $r.shorts,
+              [math]::Round($r.gross,2), [math]::Round($r.fee,2), [math]::Round($r.net,2))
+            Write-Host ("            of which long {0}  short {1}" -f `
+              [math]::Round($r.grossLong,2), [math]::Round($r.grossShort,2))
+          }
+
+          if ($results.Count -ge 3) {
+            $grosses = @($results | ForEach-Object { $_.gross })
+            $avgTrades = ($results | ForEach-Object { $_.count } | Measure-Object -Average).Average
+            # Under the null each trade is one open-to-open move with a random
+            # sign, so a run's gross has sd = moveSd * sqrt(trades), and the
+            # average of k runs narrows that by sqrt(k).
+            $runSd  = $moveSd * [math]::Sqrt($avgTrades)
+            $meanSd = $runSd / [math]::Sqrt($results.Count)
+            $mean   = ($grosses | Measure-Object -Average).Average
+            $positive = @($grosses | Where-Object { $_ -gt 0 }).Count
+
+            Write-Host ""
+            Write-Host ("  across $($results.Count) seeds: mean gross {0}, expected spread of one run +/-{1}" -f `
+              [math]::Round($mean,2), [math]::Round($runSd,2))
+            Write-Host ("  mean is {0} sd from zero ({1} of $($results.Count) runs positive)" -f `
+              [math]::Round($mean / $meanSd, 2), $positive)
+            Write-Host ("  costs took {0} per round trip on average" -f `
+              [math]::Round(($results | ForEach-Object { $_.fee / $_.count } | Measure-Object -Average).Average, 4))
+
+            # Three sd on the mean of several independent seeds is no longer a
+            # story about luck. It would mean the engine gives coin-flip trades
+            # an edge, and every result it ever reports would inherit that.
+            if ([math]::Abs($mean / $meanSd) -gt 3) {
+              $failures += ("random entry: mean gross {0} over $($results.Count) seeds is {1} sd from zero -- coin flips are not supposed to have an edge" -f `
+                [math]::Round($mean,2), [math]::Round($mean / $meanSd, 2))
+            }
           }
 
           # ===============================================================
