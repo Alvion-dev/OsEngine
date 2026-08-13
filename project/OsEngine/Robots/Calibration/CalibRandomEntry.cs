@@ -16,11 +16,21 @@ what its settings say it charges.
 Two details decide whether the measurement means anything.
 
 The seed is a parameter, so a run repeats exactly. Without it two runs give two
-numbers and there is nothing to compare.
+numbers and there is nothing to compare. The generator is built on the first
+candle rather than in the constructor: parameters are set over the API after the
+robot exists, so a generator built at construction time would always use the
+default and the parameter would be decoration.
 
 The trade count has to be in the hundreds. With a dozen trades the costs drown
 in the price noise and the check says nothing either way -- which is worse than
 failing, because it looks like a pass.
+
+Even hundreds may not be enough to state the statistical claim sharply. On daily
+candles a one-day hold carries about two percent of price noise, so the average
+over N trades is uncertain by roughly 2%/sqrt(N) -- at 300 trades that is about
+0.11%, and the cost being measured is 0.1%. The exact claim is therefore checked
+per trade -- every position must be charged (entry + close) * rate -- and the
+statistical one is reported with its error band rather than asserted.
 */
 
 namespace OsEngine.Robots.Calibration
@@ -52,8 +62,6 @@ namespace OsEngine.Robots.Calibration
             _holdCandles = CreateParameter("Hold candles", 3, 1, 50, 1);
             _entryEveryCandles = CreateParameter("Try entry every N candles", 5, 1, 50, 1);
 
-            _random = new Random(_seed.ValueInt);
-
             _tab.CandleFinishedEvent += CandleFinished;
 
             Description = "Calibration: coin-flip entries, fixed holding time. Must lose the costs.";
@@ -78,6 +86,11 @@ namespace OsEngine.Robots.Calibration
             if (candles == null || candles.Count == 0)
             {
                 return;
+            }
+
+            if (_random == null)
+            {
+                _random = new Random(_seed.ValueInt);
             }
 
             _candlesSeen++;

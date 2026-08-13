@@ -136,7 +136,7 @@ jobs:
       # end-to-end test, Tests/McpTestStand/.../Tests/TesterTests.cs, method
       # TestRunSimulation. Every earlier attempt here was an invented order and
       # every one of them failed in a way that read like a broken engine.
-      - name: First real test — buy and hold, answer known in advance
+      - name: Calibration — answers known before the tester runs
         if: env.MCP_ANSWERED == 'True'
         shell: pwsh
         run: |
@@ -147,18 +147,16 @@ jobs:
           # A backtest run on a made-up commission is not a cheap approximation,
           # it is a different answer.
           $commissionPercent = 0.05
-          # The exit is placed when this candle finishes and fills on the next
-          # one, so it must not be the last day of the series.
-          $exitDate = "20260625"
 
-          function Call($name, $toolArgs, $id) {
-            $body = @{ jsonrpc = "2.0"; id = $id; method = "tools/call"
+          $script:callId = 0
+          function Call($name, $toolArgs) {
+            $script:callId++
+            $body = @{ jsonrpc = "2.0"; id = $script:callId; method = "tools/call"
                        params = @{ name = $name; arguments = $toolArgs } } | ConvertTo-Json -Depth 10
             try {
               $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
                     -ContentType "application/json" -Body $body `
                     -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 180
-              $r | ConvertTo-Json -Depth 30 | Set-Content "artifacts/run_${id}_$name.json" -Encoding utf8
               return $r
             } catch {
               Write-Host "!!! $name : HTTP FAILURE $($_.Exception.Message)"
@@ -184,237 +182,283 @@ jobs:
             Write-Host "--- $name : $t"
           }
 
-          # 1. Quotes. TesterServer.LoadCandleFromFolder calls
+          function WaitTesterServer {
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline) {
+              $r = Call "tester_data_get_config" @{}
+              if ($r -and -not $r.result.IsError) { return }
+              Start-Sleep -Milliseconds 500
+            }
+            throw "tester server did not answer"
+          }
+
+          # Creates the robot, turns it on, binds the first Simple tab to the
+          # security the tester actually loaded, and sets the commission.
+          function NewCalibBot($strategy, $params) {
+            $bot = Payload (Call "bot_create" @{ strategy_name = $strategy })
+            if (-not $bot) { throw "bot_create refused for $strategy" }
+            $name = $bot.name
+
+            $prm = Payload (Call "bot_set_params" @{ bot_id = $name; parameters = $params })
+            if (-not $prm) { throw "bot_set_params refused for $name" }
+            if ($prm.updated_count -ne $params.Count) {
+              throw "$name : asked to set $($params.Count) parameters, engine updated $($prm.updated_count)"
+            }
+
+            $srcs = Payload (Call "bot_get_sources" @{ bot_id = $name })
+            $tabName = ($srcs.sources | Where-Object { $_.type -eq "Simple" } | Select-Object -First 1).name
+            if (-not $tabName) { throw "$name has no Simple tab" }
+
+            $tab = Payload (Call "bot_set_config_tab_simple" @{
+              bot_id = $name; tab_name = $tabName
+              server_type = "Tester"; portfolio_name = "GodMode"
+              security_class = $script:securityClass; security_name = $script:securityName
+              commission_type = "Percent"; commission_value = $commissionPercent
+              time_frame = "Day" })
+            if (-not $tab) { throw "bot_set_config_tab_simple refused for $name" }
+            if ($tab.commission_value -ne $commissionPercent) {
+              throw "$name : commission read back as $($tab.commission_value), asked for $commissionPercent"
+            }
+            Write-Host "  robot $name ($strategy) on $($tab.security_name), commission $($tab.commission_type) $($tab.commission_value)"
+            return $name
+          }
+
+          function RunTester {
+            # TestingStart() refuses outright while _lastStartSecurityTime + 5s
+            # is still in the future, and again -- silently -- while securities
+            # are joining the session. Retrying until Play is their answer.
+            Start-Sleep -Seconds 7
+            $playing = $false
+            $deadline = (Get-Date).AddSeconds(120)
+            while ((Get-Date) -lt $deadline) {
+              $st = Payload (Call "tester_start" @{ fast_forward = $true })
+              if ($st -and $st.regime -eq "Play") { $playing = $true; break }
+              Start-Sleep -Seconds 2
+            }
+            if (-not $playing) { throw "tester did not reach Play in 120s" }
+
+            # fast_forward on tester_start is best-effort; tester_fast_forward
+            # is a toggle, so check the state before pressing it.
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((Get-Date) -lt $deadline) {
+              $st = Payload (Call "tester_get_status" @{})
+              if ($st -and $st.fast_forward) { break }
+              Call "tester_fast_forward" @{} | Out-Null
+              Start-Sleep -Milliseconds 200
+            }
+
+            # Done means paused at the end of the data, not simply paused.
+            $deadline = (Get-Date).AddSeconds(600)
+            while ((Get-Date) -lt $deadline) {
+              $st = Payload (Call "tester_get_status" @{})
+              if ($st) {
+                if ($st.regime -eq "Pause" -and [datetime]$st.time_now -ge [datetime]$st.time_end) {
+                  Write-Host "  simulation finished at $($st.time_now)"
+                  return
+                }
+                if ($st.regime -eq "NotActive") { throw "tester stopped unexpectedly" }
+              }
+              Start-Sleep -Seconds 5
+            }
+            throw "tester did not finish in 600s"
+          }
+
+          function ClosedPositions($botName) {
+            $all = @()
+            $offset = 0
+            while ($true) {
+              $page = Payload (Call "bot_journal_get_closed_positions" @{
+                bot_name = $botName; include_failed = $false; limit = 500; offset = $offset })
+              if (-not $page -or $page.count -eq 0) { break }
+              $all += $page.positions
+              if ($page.positions.Count -lt 500) { break }
+              $offset += 500
+            }
+            return ,$all
+          }
+
+          # Every closed position must be charged (entry + close) * rate on both
+          # sides, and its profit must be that gross move less that charge. This
+          # is exact arithmetic -- no sample size, no noise, no judgement.
+          function CheckEveryPosition($positions) {
+            $problems = @()
+            $sumGross = 0.0; $sumFee = 0.0; $sumNet = 0.0
+            foreach ($p in $positions) {
+              $fee = ($p.entry_price + $p.close_price) * $p.volume * $commissionPercent / 100
+              $gross = if ($p.direction -eq "Long") { ($p.close_price - $p.entry_price) * $p.volume }
+                       else { ($p.entry_price - $p.close_price) * $p.volume }
+              $net = $gross - $fee
+              $sumGross += [double]$gross; $sumFee += [double]$fee; $sumNet += [double]$net
+
+              if ([math]::Abs($p.commission - $fee) -gt 0.0001) {
+                $problems += "position $($p.number): commission $($p.commission), expected $([math]::Round($fee,5))" }
+              if ([math]::Abs($p.profit_abs - $net) -gt 0.01) {
+                $problems += "position $($p.number): profit_abs $($p.profit_abs), expected $([math]::Round($net,5))" }
+              if ($problems.Count -ge 5) { break }
+            }
+            return [pscustomobject]@{
+              problems = $problems; gross = $sumGross; fee = $sumFee; net = $sumNet }
+          }
+
+          # ---------------------------------------------------------------
+          # Quotes. TesterServer.LoadCandleFromFolder calls
           # Directory.GetFiles(folder) -- not recursive. Pointing at the parent
           # of the files loads nothing, the tester keeps TimeStart at
-          # DateTime.MinValue, and TestingStart() returns at its own line 718
-          # before ever reaching Play. That is the whole of the earlier
-          # "NotActive / 0001-01-01 / zero deals".
-          # Security.Name becomes the file name; Security.NameClass is the
-          # literal "TestClass". We still read both back from the tester below
-          # rather than trust that reading.
+          # DateTime.MinValue, and TestingStart() returns before reaching Play.
+          # That was the whole of the earlier "NotActive / 0001-01-01 / zero deals".
           $src = Join-Path $env:GITHUB_WORKSPACE "calibration-data\Daily"
           if (-not (Test-Path $src)) { throw "quotes folder $src is missing from the checkout" }
           $data = Join-Path $env:OSENGINE_DIR "CalibData"
           New-Item -ItemType Directory -Force -Path $data | Out-Null
           Copy-Item "$src\*" -Destination $data -Force
-          Get-ChildItem $data -File | ForEach-Object {
-            Write-Host "quotes: $($_.Name) $($_.Length) bytes, $((Get-Content $_.FullName | Measure-Object -Line).Lines) lines"
-          }
+          $rows = @(Get-Content (Join-Path $data "SBER") | ForEach-Object {
+            $f = $_.Split(","); [pscustomobject]@{ d = $f[0]; open = [decimal]$f[2]; close = [decimal]$f[5] } })
+          Write-Host "quotes: $($rows.Count) daily candles, $($rows[0].d)..$($rows[-1].d)"
 
-          # 2. Open the tester inside the running window. terminal_launch
-          # restarts the process; the tester server then never comes up and
-          # every tester_* call answers about a server that does not exist.
-          Say "terminal_open_mode" (Call "terminal_open_mode" @{ mode = "tester" } 10)
-
-          # 3. Their WaitForTesterServer: poll until the tester answers at all.
-          $ready = $false
-          $deadline = (Get-Date).AddSeconds(60)
-          while ((Get-Date) -lt $deadline) {
-            $r = Call "tester_data_get_config" @{} 11
-            if ($r -and -not $r.result.IsError) { $ready = $true; break }
-            Start-Sleep -Milliseconds 500
-          }
-          if (-not $ready) { throw "tester server did not come up after terminal_open_mode" }
+          # Open the tester inside the running window. terminal_launch restarts
+          # the process; the tester server then never comes up.
+          Say "terminal_open_mode" (Call "terminal_open_mode" @{ mode = "tester" })
+          WaitTesterServer
           Write-Host "tester server is up"
 
-          # 4. Source first, dates later. LoadSecurities() resets TimeStart to
+          # Source first, dates later. LoadSecurities() resets TimeStart to
           # MinValue and recomputes it from the data, so dates sent in the same
           # call are overwritten by the reload that call triggers.
-          Say "tester_data_set_config(source)" (Call "tester_data_set_config" @{
+          Say "data source" (Call "tester_data_set_config" @{
             source_type = "Folder"; folder_path = $data
-            type_tester_data = "Candle"; delete_trades_from_memory = $true } 12)
+            type_tester_data = "Candle"; delete_trades_from_memory = $true })
 
-          # 5. The reload runs on a worker thread. Ask the tester what it has.
-          $securityName = ""; $securityClass = ""
+          # The reload runs on a worker thread. Ask the tester what it has.
+          $script:securityName = ""; $script:securityClass = ""
           $deadline = (Get-Date).AddSeconds(90)
           while ((Get-Date) -lt $deadline) {
-            $p = Payload (Call "tester_get_securities" @{} 13)
+            $p = Payload (Call "tester_get_securities" @{})
             if ($p -and $p.count -gt 0) {
-              $securityName  = $p.securities[0].name
-              $securityClass = $p.securities[0].class_name
-              Write-Host "tester loaded $($p.count) security(ies); using '$securityName' / '$securityClass'"
+              $script:securityName  = $p.securities[0].name
+              $script:securityClass = $p.securities[0].class_name
               break
             }
             Start-Sleep -Milliseconds 500
           }
-          if (-not $securityName) { throw "tester loaded no securities from $data" }
+          if (-not $script:securityName) { throw "tester loaded no securities from $data" }
+          Write-Host "tester loaded '$($script:securityName)' / '$($script:securityClass)'"
 
-          # 6. Now the dates stick: same source, no reload.
-          # date_to is a day past the last candle. LoadNextData pauses the
-          # moment TimeNow passes TimeEnd, and the candles carry a 10:00 stamp,
-          # so "2026-06-30T00:00:00" stops the run before the 29th and the 30th
-          # are ever delivered.
-          Say "tester_data_set_config(dates)" (Call "tester_data_set_config" @{
-            date_from = "2024-01-03T00:00:00"; date_to = "2026-07-01T00:00:00" } 14)
-          Say "tester_portfolio_set_config" (Call "tester_portfolio_set_config" @{
-            start_portfolio = 1000000; portfolio_calculation_enabled = $true } 15)
-          Say "tester_execution_set_config" (Call "tester_execution_set_config" @{
+          # Now the dates stick: same source, no reload. date_to is a day past
+          # the last candle -- LoadNextData pauses the moment TimeNow passes
+          # TimeEnd, and the candles carry a 10:00 stamp.
+          Say "dates" (Call "tester_data_set_config" @{
+            date_from = "2024-01-03T00:00:00"; date_to = "2026-07-01T00:00:00" })
+          Say "portfolio" (Call "tester_portfolio_set_config" @{
+            start_portfolio = 1000000; portfolio_calculation_enabled = $true })
+          Say "execution" (Call "tester_execution_set_config" @{
             slippage_to_simple_order = 0; slippage_to_stop_order = 0
-            order_execution_type = "Touch" } 16)
+            order_execution_type = "Touch" })
 
-          # 7. The robot. Its name is assigned by the engine and returned; the
-          # name we ask for is a request, not a fact.
-          $bot = Payload (Call "bot_create" @{ strategy_name = "CalibBuyAndHold"; name = "calibBH" } 20)
-          if (-not $bot) { throw "bot_create refused" }
-          $botName = $bot.name
-          Write-Host "robot created: $botName (class $($bot.class_name))"
+          $failures = @()
 
-          # Regime defaults to On for this robot, but their own test sets it
-          # explicitly and a silent Off is indistinguishable from a broken run.
-          $exitDateDashed = ([datetime]::ParseExact($exitDate, "yyyyMMdd", $null)).ToString("yyyy-MM-dd")
-          $prm = Payload (Call "bot_set_params" @{ bot_id = $botName
-            parameters = @{ "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = $exitDateDashed } } 21)
-          if (-not $prm) { throw "bot_set_params refused" }
-          Write-Host "parameters updated: $($prm.updated_count)"
-
-          $srcs = Payload (Call "bot_get_sources" @{ bot_id = $botName } 22)
-          $tabName = ($srcs.sources | Where-Object { $_.type -eq "Simple" } | Select-Object -First 1).name
-          if (-not $tabName) { throw "robot has no Simple tab" }
-          Write-Host "tab name from the robot: $tabName"
-
-          # Costs live on the robot tab, not in the tester. Set anywhere else
-          # and the cost check fails for a reason that is not the cost.
-          $tab = Payload (Call "bot_set_config_tab_simple" @{
-            bot_id = $botName; tab_name = $tabName
-            server_type = "Tester"; portfolio_name = "GodMode"
-            security_class = $securityClass; security_name = $securityName
-            commission_type = "Percent"; commission_value = $commissionPercent
-            time_frame = "Day" } 23)
-          if (-not $tab) { throw "bot_set_config_tab_simple refused" }
-          Write-Host "tab bound to $($tab.security_name), commission $($tab.commission_type) $($tab.commission_value)"
-
-          # 8. TestingStart() refuses outright while
-          # _lastStartSecurityTime + 5s is still in the future.
-          Start-Sleep -Seconds 7
-
-          # 9. It also refuses while the securities are still joining the
-          # session, and says so only by leaving the regime alone. Retrying
-          # until Play is their answer, not a workaround.
-          $playing = $false
-          $deadline = (Get-Date).AddSeconds(120)
-          while ((Get-Date) -lt $deadline) {
-            $st = Payload (Call "tester_start" @{ fast_forward = $true } 30)
-            if ($st) { Write-Host "    tester_start -> regime=$($st.regime) start=$($st.time_start) end=$($st.time_end)" }
-            if ($st -and $st.regime -eq "Play") { $playing = $true; break }
-            Start-Sleep -Seconds 2
-          }
-          if (-not $playing) { throw "tester did not reach Play in 120s" }
-
-          # 10. fast_forward on tester_start is best-effort; tester_fast_forward
-          # is a toggle, so check the state before pressing it.
-          $deadline = (Get-Date).AddSeconds(30)
-          while ((Get-Date) -lt $deadline) {
-            $st = Payload (Call "tester_get_status" @{} 31)
-            if ($st -and $st.fast_forward) { Write-Host "fast forward is on"; break }
-            Call "tester_fast_forward" @{} 32 | Out-Null
-            Start-Sleep -Milliseconds 200
-          }
-
-          # 11. Done means paused at the end of the data, not simply paused.
-          $finished = $false
-          $deadline = (Get-Date).AddSeconds(600)
-          while ((Get-Date) -lt $deadline) {
-            $st = Payload (Call "tester_get_status" @{} 33)
-            if ($st) {
-              Write-Host "    $($st.regime) $($st.time_now) $($st.progress_percent)%"
-              if ($st.regime -eq "Pause" -and [datetime]$st.time_now -ge [datetime]$st.time_end) { $finished = $true; break }
-              if ($st.regime -eq "NotActive") { throw "tester stopped unexpectedly" }
-            }
-            Start-Sleep -Seconds 5
-          }
-          if (-not $finished) { throw "tester did not finish in 600s" }
-          Write-Host "=== simulation finished ==="
-
-          Say "summary"    (Call "bot_journal_get_summary"          @{ bot_name = $botName } 40)
-          Say "statistics" (Call "bot_journal_get_statistics"       @{ bot_name = $botName; side = "All" } 41)
-          Say "closed"     (Call "bot_journal_get_closed_positions" @{ bot_name = $botName; include_failed = $false; limit = 100; offset = 0 } 42)
-
-          # 12. The arithmetic check, against the quotes rather than against the
-          # tester's own summary.
-          #
-          # Three claims, each read out of the engine's source rather than
-          # assumed, and each checked separately:
-          #
-          #   a) a fill happens at the OPEN of a candle. CheckCandles emits four
-          #      synthetic trades per candle -- open, high, low, close -- and
-          #      only then raises the candle-finished event.
-          #   b) an order placed when candle N finishes therefore fills on
-          #      candle N+1. Checked on the exit, whose date we chose.
-          #   c) Position.CommissionTotal charges (entry + close) * value/100.
-          #      Percent really is percent and it is taken on both sides.
-          #
-          # The entry is deliberately NOT pinned to a candle we picked: the first
-          # candle of the series is spent warming it up and never reaches the
-          # robot, so counting from the file would encode a guess about warm-up.
-          # Pinning it to the candle the engine itself stamps as open_time still
-          # catches a fill at a price that is not any open.
-          $rows = @(Get-Content (Join-Path $data "SBER") | ForEach-Object {
-            $f = $_.Split(","); [pscustomobject]@{ d = $f[0]; open = [decimal]$f[2] } })
-          function OpenOn($yyyymmdd) {
-            $row = $rows | Where-Object { $_.d -eq $yyyymmdd } | Select-Object -First 1
-            if (-not $row) { throw "no candle dated $yyyymmdd" }
-            return $row.open
-          }
-          function FirstDateAfter($yyyymmdd) {
-            $row = $rows | Where-Object { $_.d -gt $yyyymmdd } | Select-Object -First 1
-            if (-not $row) { throw "no candle after $yyyymmdd" }
-            return $row.d
-          }
-
-          $closed = Payload (Call "bot_journal_get_closed_positions" @{
-            bot_name = $botName; include_failed = $false; limit = 100; offset = 0 } 43)
-          if (-not $closed -or $closed.count -eq 0) {
-            throw "no closed positions -- the robot ended holding, so nothing was measured"
-          }
-          if ($closed.count -ne 1) { throw "expected exactly 1 closed position, got $($closed.count)" }
-          $p = $closed.positions[0]
+          # ===============================================================
+          # 1. Buy and hold. The answer is fixed by arithmetic before the
+          #    tester is asked: the price move, less one round trip of costs.
+          # ===============================================================
           Write-Host ""
-          Write-Host "=== what the tester reported ==="
-          Write-Host ($p | ConvertTo-Json -Depth 6)
+          Write-Host "=== 1. BUY AND HOLD ==="
+          $exitDate = "20260625"
+          $exitDashed = ([datetime]::ParseExact($exitDate, "yyyyMMdd", $null)).ToString("yyyy-MM-dd")
+          $bh = NewCalibBot "CalibBuyAndHold" @{
+            "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = $exitDashed }
+          RunTester
+          $bhPositions = ClosedPositions $bh
+          if ($bhPositions.Count -ne 1) {
+            $failures += "buy and hold: expected exactly 1 closed position, got $($bhPositions.Count)"
+          } else {
+            $p = $bhPositions[0]
+            Write-Host ($p | ConvertTo-Json -Depth 6)
 
-          $openDay  = ([datetime]$p.open_time).ToString("yyyyMMdd")
-          $closeDay = ([datetime]$p.close_time).ToString("yyyyMMdd")
-          $expectedEntry = OpenOn $openDay
-          $expectedExit  = OpenOn $closeDay
-          $expectedFee   = ($expectedEntry + $expectedExit) * $commissionPercent / 100
-          $expectedNet   = ($expectedExit - $expectedEntry) * $p.volume - $expectedFee
-          $exitShouldBe  = FirstDateAfter $exitDate
+            # Three separate claims, each read out of the engine's source:
+            #   a) a fill happens at the OPEN of a candle -- CheckCandles emits
+            #      open/high/low/close as trades, then raises candle-finished;
+            #   b) so an order placed on candle N fills on candle N+1. Checked
+            #      on the exit, whose date we chose;
+            #   c) commission is (entry + close) * rate, both sides.
+            # The entry is deliberately not pinned to a candle we picked: the
+            # first candle of the series warms it up and never reaches the
+            # robot, so counting from the file would encode a guess.
+            $openDay  = ([datetime]$p.open_time).ToString("yyyyMMdd")
+            $closeDay = ([datetime]$p.close_time).ToString("yyyyMMdd")
+            $expEntry = ($rows | Where-Object { $_.d -eq $openDay }).open
+            $expExit  = ($rows | Where-Object { $_.d -eq $closeDay }).open
+            $shouldCloseOn = ($rows | Where-Object { $_.d -gt $exitDate } | Select-Object -First 1).d
 
-          Write-Host "=== what the quotes say it must be ==="
-          Write-Host ("  entry {0} on {1}   exit {2} on {3}   fee {4}   net {5}" -f `
-            $expectedEntry, $openDay, $expectedExit, $closeDay,
-            [math]::Round($expectedFee, 5), [math]::Round($expectedNet, 5))
+            if ($closeDay -ne $shouldCloseOn) {
+              $failures += "buy and hold: closed on $closeDay; an order placed when $exitDate finished must fill on $shouldCloseOn" }
+            if ([math]::Abs($p.entry_price - $expEntry) -gt 0.0001) {
+              $failures += "buy and hold: entry_price $($p.entry_price) is not the open of $openDay ($expEntry)" }
+            if ([math]::Abs($p.close_price - $expExit) -gt 0.0001) {
+              $failures += "buy and hold: close_price $($p.close_price) is not the open of $closeDay ($expExit)" }
 
-          # profit_abs is ProfitPortfolioAbs, which already subtracts
-          # CommissionTotal() -- comparing it against a gross expectation would
-          # fail by exactly the cost we are here to check.
-          $problems = @()
-          if ($closeDay -ne $exitShouldBe) {
-            $problems += "closed on $closeDay; an order placed when $exitDate finished must fill on $exitShouldBe" }
-          if ([math]::Abs($p.entry_price - $expectedEntry) -gt 0.0001) {
-            $problems += "entry_price $($p.entry_price) is not the open of $openDay ($expectedEntry)" }
-          if ([math]::Abs($p.close_price - $expectedExit) -gt 0.0001) {
-            $problems += "close_price $($p.close_price) is not the open of $closeDay ($expectedExit)" }
-          if ([math]::Abs($p.commission - $expectedFee) -gt 0.0001) {
-            $problems += "commission $($p.commission), expected $([math]::Round($expectedFee,5))" }
-          if ([math]::Abs($p.profit_abs - $expectedNet) -gt 0.01) {
-            $problems += "profit_abs $($p.profit_abs), expected $([math]::Round($expectedNet,5))" }
-
-          if ($problems.Count -gt 0) {
-            Write-Host "=== MISMATCH ==="
-            $problems | ForEach-Object { Write-Host "  $_" }
-            throw "buy and hold disagrees with its own arithmetic"
+            $r = CheckEveryPosition $bhPositions
+            $failures += $r.problems | ForEach-Object { "buy and hold: $_" }
+            Write-Host ("  gross {0}  fee {1}  net {2}" -f `
+              [math]::Round($r.gross,5), [math]::Round($r.fee,5), [math]::Round($r.net,5))
+            if ($r.fee -le 0) { $failures += "buy and hold: no commission charged on a completed round trip" }
           }
-          Write-Host "=== buy and hold agrees with arithmetic to the kopeck ==="
 
-          # The cost check rides along: zero commission on a round trip would
-          # pass every profit test and be wrong about every one of them. It is
-          # not hypothetical -- this is what the engine did before the fix in
-          # RobotsApi.ApplyBotConfigTabSimple.
-          if ($p.commission -le 0) { throw "commission was not charged on a completed round trip" }
-          Write-Host "=== costs were charged: $($p.commission) on a round trip ==="
+          # ===============================================================
+          # 2. Random entry. No edge by construction, so over many trades the
+          #    result must be the cost of the turnover and nothing else.
+          # ===============================================================
+          Write-Host ""
+          Write-Host "=== 2. RANDOM ENTRY ==="
+          Call "tester_stop" @{} | Out-Null
+          Call "bot_delete" @{ bot_id = $bh } | Out-Null
+          WaitTesterServer
 
+          # Enter every candle, hold one: the shortest cycle this data allows,
+          # which is what maximises the trade count on 633 daily candles.
+          $re = NewCalibBot "CalibRandomEntry" @{
+            "Regime" = "On"; "Volume" = 1; "Seed" = 20260812
+            "Hold candles" = 1; "Try entry every N candles" = 1 }
+          RunTester
+          $rePositions = ClosedPositions $re
+          Write-Host "  closed positions: $($rePositions.Count)"
+          if ($rePositions.Count -lt 100) {
+            $failures += "random entry: only $($rePositions.Count) trades -- too few for the costs to show above price noise"
+          } else {
+            $r = CheckEveryPosition $rePositions
+            $failures += $r.problems | ForEach-Object { "random entry: $_" }
+
+            $longs  = @($rePositions | Where-Object { $_.direction -eq "Long" }).Count
+            $shorts = @($rePositions | Where-Object { $_.direction -eq "Short" }).Count
+            Write-Host "  long $longs / short $shorts"
+            Write-Host ("  gross {0}  fee {1}  net {2}" -f `
+              [math]::Round($r.gross,2), [math]::Round($r.fee,2), [math]::Round($r.net,2))
+
+            if ($r.fee -le 0) {
+              $failures += "random entry: $($rePositions.Count) round trips and no commission at all"
+            }
+
+            # The statistical claim, reported rather than asserted. A coin flip
+            # on daily candles carries about 2% of price noise per trade, so the
+            # sum of gross results is uncertain by roughly that times sqrt(N)
+            # times the price -- of the same order as the fee being measured.
+            # Asserting it here would be a coin toss dressed as a check.
+            $avgPrice = ($rePositions | ForEach-Object { [double]$_.entry_price } | Measure-Object -Average).Average
+            $noise = 0.02 * $avgPrice * [math]::Sqrt($rePositions.Count)
+            Write-Host ("  gross is {0} against a noise band of about +/-{1} -- {2}" -f `
+              [math]::Round($r.gross,2), [math]::Round($noise,2),
+              $(if ([math]::Abs($r.gross) -le $noise) { "consistent with no edge" } else { "OUTSIDE the band, worth reading twice" }))
+            Write-Host ("  costs ate {0} on {1} round trips, {2} per trade" -f `
+              [math]::Round($r.fee,2), $rePositions.Count, [math]::Round($r.fee / $rePositions.Count, 4))
+          }
+
+          # ===============================================================
+          Write-Host ""
+          if ($failures.Count -gt 0) {
+            Write-Host "=== FAILURES ==="
+            $failures | ForEach-Object { Write-Host "  $_" }
+            throw "calibration disagreed with arithmetic"
+          }
+          Write-Host "=== every check agreed with arithmetic ==="
       - name: Collect whatever it wrote down
         if: always()
         shell: pwsh
