@@ -208,9 +208,14 @@ jobs:
             }
           }
 
-          $data = Join-Path $env:GITHUB_WORKSPACE "project/OsEngine/Data/Calibration"
-          Write-Host "data folder: $data"
-          Get-ChildItem -Recurse $data | Select-Object FullName,Length | Format-Table
+          # Not under project/OsEngine/Data: .gitignore line 81 excludes Data/,
+          # so the quotes were silently never committed and the failure surfaced
+          # on the runner as a missing path.
+          $data = Join-Path $env:GITHUB_WORKSPACE "calibration-data"
+          if (-not (Test-Path $data)) { throw "quotes folder $data is missing from the checkout" }
+          Get-ChildItem -Recurse $data -File | ForEach-Object {
+            Write-Host "quotes: $($_.FullName) $($_.Length) bytes, $((Get-Content $_.FullName | Measure-Object -Line).Lines) lines"
+          }
 
           # Costs live on the robot tab, not in the tester. Setting them in the
           # wrong place would make the cost check fail for the wrong reason.
