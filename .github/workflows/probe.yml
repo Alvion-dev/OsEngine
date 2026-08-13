@@ -239,6 +239,23 @@ jobs:
             if ($tab.commission_value -ne $commissionPercent) {
               throw "$name : commission read back as $($tab.commission_value), asked for $commissionPercent"
             }
+
+            # Orders live 50 seconds by default -- BotManualControl sets
+            # SecondToOpenIsOn and SecondToCloseIsOn to true with a 50 second
+            # span. A daily bar is 86400 seconds, so the order fills long
+            # before that matters. A minute bar is 60, which is ten seconds
+            # MORE than the lifetime: the order dies one step before it could
+            # fill, and only gets through when the tester's clock jumps a gap
+            # in the data. That is the whole of "48 round trips on 25 000
+            # bars" -- not an engine limit, a default that is shorter than a
+            # minute.
+            $ps = Payload (Call "bot_set_position_support" @{
+              bot_id = $name; tab_name = $tabName
+              second_to_open_is_on = $false; second_to_close_is_on = $false })
+            if (-not $ps) { throw "bot_set_position_support refused for $name" }
+            if ($ps.second_to_open_is_on -or $ps.second_to_close_is_on) {
+              throw "$name : order lifetime still on (open=$($ps.second_to_open_is_on), close=$($ps.second_to_close_is_on))"
+            }
             Write-Host "  robot $name ($strategy) on $($tab.security_name), commission $($tab.commission_type) $($tab.commission_value)"
             return $name
           }
@@ -504,7 +521,7 @@ jobs:
           # its own and the runs cost real minutes each.
           # Одно зерно на диагностический прогон: выясняем, почему сделок мало,
           # а не считаем статистику по четырём одинаковым ответам.
-          $seeds = @(20260812)
+          $seeds = @(20260812, 1, 7, 42)
           $results = @()
           $previousBot = $bh
 
