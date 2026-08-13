@@ -504,8 +504,17 @@ jobs:
             # гипотезы из чтения.
             Write-Host ""
             Write-Host "=== ЗАМЕР ИЗ ЗАСЛОНОВ ==="
-            $logs = Get-ChildItem -Recurse -Path $env:OSENGINE_DIR -Include *.txt -ErrorAction SilentlyContinue
-            $hits = $logs | Select-String -Pattern "PROBE|CLOSEPROBE" -ErrorAction SilentlyContinue
+            # Логи пишутся с задержкой: прошлый прогон читал их в ту же секунду,
+            # в которую закончилась симуляция, и не нашёл ничего. Плюс печать из
+            # вкладки робота идёт не в тот же файл, что печать из тестера,
+            # поэтому ищем по всем файлам, а не по *.txt.
+            Start-Sleep -Seconds 15
+            $logs = Get-ChildItem -Recurse -Path $env:OSENGINE_DIR -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -in ".txt", ".log", ".csv" -and $_.Length -lt 20MB }
+            $hits = $logs | Select-String -Pattern "PROBE gate|PROBE FILL|CLOSEPROBE" -ErrorAction SilentlyContinue
+            if ($hits) {
+              Write-Host "  найдено в файлах: $(($hits | ForEach-Object { $_.Path } | Sort-Object -Unique) -join ', ')"
+            }
             if (-not $hits) {
               Write-Host "  строк замера не найдено — лог тестера пишется не в *.txt под OSENGINE_DIR"
               Write-Host "  файлы, которые есть:"
