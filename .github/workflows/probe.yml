@@ -217,6 +217,14 @@ jobs:
               throw "$name : asked to set $($params.Count) parameters, engine updated $($prm.updated_count)"
             }
 
+            # Read them back rather than trust updated_count. The commission bug
+            # was exactly this shape: the engine echoed the value it had been
+            # given while the part that uses it had never heard of it.
+            $back = Payload (Call "bot_get_params" @{ bot_id = $name })
+            $shown = ($back.parameters | Where-Object { $params.ContainsKey($_.name) } |
+              ForEach-Object { "$($_.name)=$($_.value)" }) -join ", "
+            Write-Host "  параметры робота: $shown"
+
             $srcs = Payload (Call "bot_get_sources" @{ bot_id = $name })
             $tabName = ($srcs.sources | Where-Object { $_.type -eq "Simple" } | Select-Object -First 1).name
             if (-not $tabName) { throw "$name has no Simple tab" }
@@ -302,6 +310,15 @@ jobs:
             $open = Payload (Call "bot_journal_get_open_positions" @{
               bot_name = $botName; limit = 500; offset = 0 })
             Write-Host "  позиции: всего $($all.Count) [$summary], открытых $($open.count)"
+
+            # When the count is far from what the robot's logic implies, the
+            # timings say which of the two is wrong -- the robot or the engine.
+            # Positions come back newest first, so the tail is the beginning.
+            $first = @($all | Sort-Object open_time | Select-Object -First 6)
+            foreach ($q in $first) {
+              Write-Host ("    #{0} {1} -> {2}  {3} {4} -> {5}" -f `
+                $q.number, $q.open_time, $q.close_time, $q.direction, $q.entry_price, $q.close_price)
+            }
             return ,@($all | Where-Object { $_.state -eq "Done" })
           }
 
