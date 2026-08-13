@@ -117,44 +117,6 @@ jobs:
 
           "MCP_ANSWERED=$answered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Open the tester and see if the factory knows our robots
-        if: env.MCP_ANSWERED == 'True'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          function Call($name, $toolArgs, $id) {
-            $body = @{ jsonrpc = "2.0"; id = $id; method = "tools/call"
-                       params = @{ name = $name; arguments = $toolArgs } } | ConvertTo-Json -Depth 8
-            Write-Host ">>> $name $(($toolArgs | ConvertTo-Json -Compress))"
-            try {
-              $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
-                    -ContentType "application/json" -Body $body `
-                    -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 60
-              $r | ConvertTo-Json -Depth 25 | Set-Content "artifacts/$name.json" -Encoding utf8
-              $err = $r.result.IsError
-              Write-Host "--- $name : $(if ($err) { 'REFUSED' } else { 'ok' })"
-              if ($err) { Write-Host "    $($r.result.Content[0].Text)" }
-              return $r
-            } catch {
-              Write-Host "--- $name : HTTP FAILURE $($_.Exception.Message)"
-              return $null
-            }
-          }
-
-          # bot_get_list needs a mode that supports robots; without it the
-          # refusal reads like a missing robot rather than a missing terminal.
-          Call "terminal_launch" @{ mode = "tester" } 10 | Out-Null
-          Start-Sleep -Seconds 25
-          Call "terminal_get_status" @{} 11 | Out-Null
-          Call "bot_get_list" @{} 12 | Out-Null
-
-          # The real question: can the factory build what we added? A robot the
-          # compiler accepted but the factory never registered is invisible here.
-          foreach ($bot in @("CalibBuyAndHold", "CalibRandomEntry", "CalibLookahead")) {
-            Call "bot_create" @{ name = "probe$bot"; strategy_name = $bot } (100 + $bot.Length) | Out-Null
-          }
-          Call "bot_get_list" @{} 20 | Out-Null
-
       - name: Save the whole tool surface, schemas and all
         if: env.MCP_ANSWERED == 'True'
         shell: pwsh
@@ -170,99 +132,190 @@ jobs:
           $r.result | ConvertTo-Json -Depth 30 | Set-Content -Path artifacts/tools.json -Encoding utf8
           Write-Host "tools offered: $($r.result.tools.Count)"
 
-          # What data sets exist out of the box, and what the tester thinks it
-          # is configured with right now. Both are needed before loading history.
-          foreach ($call in @("data_get_sets", "tester_data_get_config", "tester_execution_get_config", "tester_portfolio_get_config")) {
-            $b = @{ jsonrpc = "2.0"; id = 3; method = "tools/call"
-                    params = @{ name = $call; arguments = @{} } } | ConvertTo-Json -Depth 6
-            try {
-              $resp = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
-                        -ContentType "application/json" -Body $b `
-                        -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 30
-              $resp | ConvertTo-Json -Depth 20 | Set-Content -Path "artifacts/$call.json" -Encoding utf8
-              Write-Host "--- $call : answered"
-            } catch {
-              Write-Host "--- $call : FAILED $($_.Exception.Message)"
-            }
-          }
-
+      # The order below is not ours. It is the order in the project's own
+      # end-to-end test, Tests/McpTestStand/.../Tests/TesterTests.cs, method
+      # TestRunSimulation. Every earlier attempt here was an invented order and
+      # every one of them failed in a way that read like a broken engine.
       - name: First real test — buy and hold, answer known in advance
         if: env.MCP_ANSWERED == 'True'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
           function Call($name, $toolArgs, $id) {
             $body = @{ jsonrpc = "2.0"; id = $id; method = "tools/call"
                        params = @{ name = $name; arguments = $toolArgs } } | ConvertTo-Json -Depth 10
-            Write-Host ">>> $name $(($toolArgs | ConvertTo-Json -Compress))"
             try {
               $r = Invoke-RestMethod -Uri "http://localhost:6500/api/v1/mcp" -Method Post `
                     -ContentType "application/json" -Body $body `
-                    -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 120
-              $r | ConvertTo-Json -Depth 30 | Set-Content "artifacts/run_$name$id.json" -Encoding utf8
-              if ($r.result.IsError) { Write-Host "    REFUSED: $($r.result.Content[0].Text)" }
-              else { Write-Host "    ok: $(($r.result.Content[0].Text))".Substring(0, [Math]::Min(300, "    ok: $(($r.result.Content[0].Text))".Length)) }
+                    -Headers @{ "X-Api-Key" = "osengine-mcp-default-key" } -TimeoutSec 180
+              $r | ConvertTo-Json -Depth 30 | Set-Content "artifacts/run_${id}_$name.json" -Encoding utf8
               return $r
             } catch {
-              Write-Host "    HTTP FAILURE $($_.Exception.Message)"
+              Write-Host "!!! $name : HTTP FAILURE $($_.Exception.Message)"
               return $null
             }
           }
 
-          # Not under project/OsEngine/Data: .gitignore line 81 excludes Data/,
-          # so the quotes were silently never committed and the failure surfaced
-          # on the runner as a missing path.
-          $data = Join-Path $env:GITHUB_WORKSPACE "calibration-data"
-          if (-not (Test-Path $data)) { throw "quotes folder $data is missing from the checkout" }
-          Get-ChildItem -Recurse $data -File | ForEach-Object {
-            Write-Host "quotes: $($_.FullName) $($_.Length) bytes, $((Get-Content $_.FullName | Measure-Object -Line).Lines) lines"
+          # Every payload is a JSON string nested inside result.Content[0].Text.
+          # Reading result directly gives an object that is always "there" and
+          # always empty, which is how a refusal passes for a success.
+          function Payload($r) {
+            if (-not $r) { return $null }
+            if ($r.result.IsError) { return $null }
+            if (-not $r.result.Content) { return $null }
+            return ($r.result.Content[0].Text | ConvertFrom-Json)
           }
 
-          # Costs live on the robot tab, not in the tester. Setting them in the
-          # wrong place would make the cost check fail for the wrong reason.
-          Call "bot_create" @{ strategy_name = "CalibBuyAndHold"; name = "calibBH" } 30 | Out-Null
-          # The tab name is generated by the robot, not chosen by us. Asking and
-          # then hardcoding a guess is how the previous run spent itself: the
-          # answer was on screen and ignored.
-          $src = Call "bot_get_sources" @{ bot_id = "calibBH" } 31
-          $tabName = ($src.result.Content[0].Text | ConvertFrom-Json).sources[0].name
-          if (-not $tabName) { throw "bot_get_sources returned no tab" }
-          Write-Host "tab name from the robot: $tabName"
-          Call "bot_set_config_tab_simple" @{
-            bot_id = "calibBH"; tab_name = $tabName
-            server_type = "Tester"; portfolio_name = "GodMode"
-            security_class = "TestClass"; security_name = "SBER"
-            commission_type = "Percent"; commission_value = 0.05
-            time_frame = "Day"; events_is_on = $true
-          } 32 | Out-Null
-          Call "bot_set_params" @{ bot_id = "calibBH"
-            parameters = @{ "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = "2026-06-30" } } 33 | Out-Null
+          function Say($name, $r) {
+            if (-not $r) { Write-Host "--- $name : no response"; return }
+            if ($r.result.IsError) { Write-Host "--- $name : REFUSED -- $($r.result.Content[0].Text)"; return }
+            $t = $r.result.Content[0].Text
+            if ($t.Length -gt 400) { $t = $t.Substring(0, 400) + " ..." }
+            Write-Host "--- $name : $t"
+          }
 
-          Call "tester_data_set_config" @{
+          # 1. Quotes. TesterServer.LoadCandleFromFolder calls
+          # Directory.GetFiles(folder) -- not recursive. Pointing at the parent
+          # of the files loads nothing, the tester keeps TimeStart at
+          # DateTime.MinValue, and TestingStart() returns at its own line 718
+          # before ever reaching Play. That is the whole of the earlier
+          # "NotActive / 0001-01-01 / zero deals".
+          # Security.Name becomes the file name; Security.NameClass is the
+          # literal "TestClass". We still read both back from the tester below
+          # rather than trust that reading.
+          $src = Join-Path $env:GITHUB_WORKSPACE "calibration-data\Daily"
+          if (-not (Test-Path $src)) { throw "quotes folder $src is missing from the checkout" }
+          $data = Join-Path $env:OSENGINE_DIR "CalibData"
+          New-Item -ItemType Directory -Force -Path $data | Out-Null
+          Copy-Item "$src\*" -Destination $data -Force
+          Get-ChildItem $data -File | ForEach-Object {
+            Write-Host "quotes: $($_.Name) $($_.Length) bytes, $((Get-Content $_.FullName | Measure-Object -Line).Lines) lines"
+          }
+
+          # 2. Open the tester inside the running window. terminal_launch
+          # restarts the process; the tester server then never comes up and
+          # every tester_* call answers about a server that does not exist.
+          Say "terminal_open_mode" (Call "terminal_open_mode" @{ mode = "tester" } 10)
+
+          # 3. Their WaitForTesterServer: poll until the tester answers at all.
+          $ready = $false
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Get-Date) -lt $deadline) {
+            $r = Call "tester_data_get_config" @{} 11
+            if ($r -and -not $r.result.IsError) { $ready = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ready) { throw "tester server did not come up after terminal_open_mode" }
+          Write-Host "tester server is up"
+
+          # 4. Source first, dates later. LoadSecurities() resets TimeStart to
+          # MinValue and recomputes it from the data, so dates sent in the same
+          # call are overwritten by the reload that call triggers.
+          Say "tester_data_set_config(source)" (Call "tester_data_set_config" @{
             source_type = "Folder"; folder_path = $data
-            type_tester_data = "Candle"
-            date_from = "2024-01-03"; date_to = "2026-06-30"
-          } 34 | Out-Null
-          Call "tester_portfolio_set_config" @{ start_portfolio = 1000000 } 35 | Out-Null
-          Call "tester_execution_set_config" @{ slippage_to_simple_order = 0; order_execution_type = "Touch" } 36 | Out-Null
+            type_tester_data = "Candle"; delete_trades_from_memory = $true } 12)
 
-          Call "tester_start" @{ fast_forward = $true } 37 | Out-Null
-
-          # The tester runs asynchronously; poll rather than guess a duration.
-          for ($i = 0; $i -lt 30; $i++) {
-            Start-Sleep -Seconds 10
-            $st = Call "tester_get_status" @{} (400 + $i)
-            if ($st -and -not $st.result.IsError) { Write-Host "    tester: $($st.result.Content[0].Text)" }
-            $sum = Call "bot_journal_get_summary" @{ bot_name = "calibBH" } (450 + $i)
-            if ($sum -and -not $sum.result.IsError) {
-              $j = $sum.result.Content[0].Text | ConvertFrom-Json
-              Write-Host "    profit so far: $($j.total_profit_abs)"
-              if ($j.period_end) { Write-Host "    finished, period ends $($j.period_end)"; break }
+          # 5. The reload runs on a worker thread. Ask the tester what it has.
+          $securityName = ""; $securityClass = ""
+          $deadline = (Get-Date).AddSeconds(90)
+          while ((Get-Date) -lt $deadline) {
+            $p = Payload (Call "tester_get_securities" @{} 13)
+            if ($p -and $p.count -gt 0) {
+              $securityName  = $p.securities[0].name
+              $securityClass = $p.securities[0].class_name
+              Write-Host "tester loaded $($p.count) security(ies); using '$securityName' / '$securityClass'"
+              break
             }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $securityName) { throw "tester loaded no securities from $data" }
+
+          # 6. Now the dates stick: same source, no reload.
+          Say "tester_data_set_config(dates)" (Call "tester_data_set_config" @{
+            date_from = "2024-01-03T00:00:00"; date_to = "2026-06-30T00:00:00" } 14)
+          Say "tester_portfolio_set_config" (Call "tester_portfolio_set_config" @{
+            start_portfolio = 1000000; portfolio_calculation_enabled = $true } 15)
+          Say "tester_execution_set_config" (Call "tester_execution_set_config" @{
+            slippage_to_simple_order = 0; slippage_to_stop_order = 0
+            order_execution_type = "Touch" } 16)
+
+          # 7. The robot. Its name is assigned by the engine and returned; the
+          # name we ask for is a request, not a fact.
+          $bot = Payload (Call "bot_create" @{ strategy_name = "CalibBuyAndHold"; name = "calibBH" } 20)
+          if (-not $bot) { throw "bot_create refused" }
+          $botName = $bot.name
+          Write-Host "robot created: $botName (class $($bot.class_name))"
+
+          # Regime defaults to On for this robot, but their own test sets it
+          # explicitly and a silent Off is indistinguishable from a broken run.
+          $prm = Payload (Call "bot_set_params" @{ bot_id = $botName
+            parameters = @{ "Regime" = "On"; "Volume" = 1; "Exit date yyyy-MM-dd" = "2026-06-30" } } 21)
+          if (-not $prm) { throw "bot_set_params refused" }
+          Write-Host "parameters updated: $($prm.updated_count)"
+
+          $srcs = Payload (Call "bot_get_sources" @{ bot_id = $botName } 22)
+          $tabName = ($srcs.sources | Where-Object { $_.type -eq "Simple" } | Select-Object -First 1).name
+          if (-not $tabName) { throw "robot has no Simple tab" }
+          Write-Host "tab name from the robot: $tabName"
+
+          # Costs live on the robot tab, not in the tester. Set anywhere else
+          # and the cost check fails for a reason that is not the cost.
+          $tab = Payload (Call "bot_set_config_tab_simple" @{
+            bot_id = $botName; tab_name = $tabName
+            server_type = "Tester"; portfolio_name = "GodMode"
+            security_class = $securityClass; security_name = $securityName
+            commission_type = "Percent"; commission_value = 0.05
+            time_frame = "Day" } 23)
+          if (-not $tab) { throw "bot_set_config_tab_simple refused" }
+          Write-Host "tab bound to $($tab.security_name), commission $($tab.commission_type) $($tab.commission_value)"
+
+          # 8. TestingStart() refuses outright while
+          # _lastStartSecurityTime + 5s is still in the future.
+          Start-Sleep -Seconds 7
+
+          # 9. It also refuses while the securities are still joining the
+          # session, and says so only by leaving the regime alone. Retrying
+          # until Play is their answer, not a workaround.
+          $playing = $false
+          $deadline = (Get-Date).AddSeconds(120)
+          while ((Get-Date) -lt $deadline) {
+            $st = Payload (Call "tester_start" @{ fast_forward = $true } 30)
+            if ($st) { Write-Host "    tester_start -> regime=$($st.regime) start=$($st.time_start) end=$($st.time_end)" }
+            if ($st -and $st.regime -eq "Play") { $playing = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $playing) { throw "tester did not reach Play in 120s" }
+
+          # 10. fast_forward on tester_start is best-effort; tester_fast_forward
+          # is a toggle, so check the state before pressing it.
+          $deadline = (Get-Date).AddSeconds(30)
+          while ((Get-Date) -lt $deadline) {
+            $st = Payload (Call "tester_get_status" @{} 31)
+            if ($st -and $st.fast_forward) { Write-Host "fast forward is on"; break }
+            Call "tester_fast_forward" @{} 32 | Out-Null
+            Start-Sleep -Milliseconds 200
           }
 
-          Call "bot_journal_get_closed_positions" @{ bot_name = "calibBH"; limit = 50 } 500 | Out-Null
-          Call "bot_journal_get_statistics" @{ bot_name = "calibBH" } 501 | Out-Null
-          Call "bot_journal_get_summary" @{ bot_name = "calibBH" } 502 | Out-Null
+          # 11. Done means paused at the end of the data, not simply paused.
+          $finished = $false
+          $deadline = (Get-Date).AddSeconds(600)
+          while ((Get-Date) -lt $deadline) {
+            $st = Payload (Call "tester_get_status" @{} 33)
+            if ($st) {
+              Write-Host "    $($st.regime) $($st.time_now) $($st.progress_percent)%"
+              if ($st.regime -eq "Pause" -and [datetime]$st.time_now -ge [datetime]$st.time_end) { $finished = $true; break }
+              if ($st.regime -eq "NotActive") { throw "tester stopped unexpectedly" }
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $finished) { throw "tester did not finish in 600s" }
+          Write-Host "=== simulation finished ==="
+
+          Say "summary"    (Call "bot_journal_get_summary"          @{ bot_name = $botName } 40)
+          Say "statistics" (Call "bot_journal_get_statistics"       @{ bot_name = $botName; side = "All" } 41)
+          Say "closed"     (Call "bot_journal_get_closed_positions" @{ bot_name = $botName; include_failed = $false; limit = 100; offset = 0 } 42)
 
       - name: Collect whatever it wrote down
         if: always()
