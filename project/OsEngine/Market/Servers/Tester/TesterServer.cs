@@ -1264,6 +1264,34 @@ namespace OsEngine.Market.Servers.Tester
             }
         }
 
+        // CALIBRATION PROBE. Four hypotheses about why a closing order never
+        // fills on continuous minute bars were each argued from this code and
+        // each refuted by a run. Reading is evidently not identifying the gate,
+        // so the gate reports itself: the first few dozen decisions are logged
+        // with the values they were taken on. Remove with the probe.
+        private static int _probeCount;
+
+        private void Probe(string verdict, Order order, Candle lastCandle)
+        {
+            if (_probeCount >= 60)
+            {
+                return;
+            }
+            _probeCount++;
+
+            SendLogMessage(
+                "PROBE " + verdict
+                + " | side=" + order.Side
+                + " type=" + order.TypeOrder
+                + " stopOrProfit=" + order.IsStopOrProfit
+                + " price=" + order.Price
+                + " create=" + order.TimeCreate.ToString("yyyy-MM-dd HH:mm:ss")
+                + " callback=" + order.TimeCallBack.ToString("yyyy-MM-dd HH:mm:ss")
+                + " candle=" + (lastCandle == null ? "null" : lastCandle.TimeStart.ToString("yyyy-MM-dd HH:mm:ss"))
+                + " serverTime=" + ServerTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                LogMessageType.System);
+        }
+
         private bool CheckOrdersInCandleTest(Order order, Candle lastCandle)
         {
             decimal minPrice = decimal.MaxValue;
@@ -1283,6 +1311,7 @@ namespace OsEngine.Market.Servers.Tester
                 && order.IsStopOrProfit != true)
             {
                 //CanselOnBoardOrder(order);
+                Probe("gate-callback", order, lastCandle);
                 return false;
             }
 
@@ -1330,8 +1359,11 @@ namespace OsEngine.Market.Servers.Tester
             {
                 if (order.TimeCreate >= lastCandle.TimeStart)
                 {
+                    Probe("gate-create", order, lastCandle);
                     return false;
                 }
+
+                Probe("FILL-market", order, lastCandle);
 
                 decimal realPrice = lastCandle.Open;
 
