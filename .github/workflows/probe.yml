@@ -13,6 +13,12 @@ name: probe
 
 on:
   workflow_dispatch:
+    inputs:
+      preset:
+        description: 'Какой набор котировок гонять'
+        type: choice
+        default: Min1
+        options: [Min1, Daily, Gaps]
 
 jobs:
   probe:
@@ -154,15 +160,35 @@ jobs:
           # daily bars in a dozen places -- one date per bar, "the next day"
           # meaning "the next bar" -- and every one of those would have quietly
           # produced a wrong expectation on minute data rather than an error.
-          # Опыт с разрывами доказал своё и выключен; данные и код остались,
-          # включается одним флагом. По умолчанию — дневные, на них
-          # четвёрка зелёная.
-          $experiment = $false
-          $dataFolder = "Min1"       # подпапка calibration-data
-          $timeFrame  = "Min1"       # TimeFrame движка, должен совпадать с данными
-          $dateFrom   = "2026-06-01T00:00:00"
-          $dateTo     = "2026-07-01T00:00:00"
-          $exitDate   = "20260625"   # день, на первом баре которого выходим
+          #
+          # Пять величин ниже обязаны меняться вместе: папка с котировками, шаг
+          # свечи в движке и три даты внутри ряда. Раньше их правили по одной
+          # руками перед каждым прогоном, и это ровно тот случай, где ошибка
+          # молчит: несовпадение папки и шага даёт не отказ, а пустой ряд и
+          # ноль сделок. Поэтому наборы заданы целиком и выбираются одним
+          # словом при запуске.
+          $preset = "${{ inputs.preset }}"
+          if (-not $preset) { $preset = "Min1" }
+          $presets = @{
+            Min1  = @{ folder = "Min1";  frame = "Min1"
+                       from = "2026-06-01T00:00:00"; to = "2026-07-01T00:00:00"
+                       exit = "20260625"; experiment = $false }
+            Daily = @{ folder = "Daily"; frame = "Day"
+                       from = "2024-01-03T00:00:00"; to = "2026-07-01T00:00:00"
+                       exit = "20260625"; experiment = $false }
+            Gaps  = @{ folder = "Gaps";  frame = "Min1"
+                       from = "2026-06-01T00:00:00"; to = "2026-07-01T00:00:00"
+                       exit = "20260625"; experiment = $true }
+          }
+          if (-not $presets.ContainsKey($preset)) { throw "неизвестный набор $preset" }
+          $p = $presets[$preset]
+          $experiment = $p.experiment
+          $dataFolder = $p.folder    # подпапка calibration-data
+          $timeFrame  = $p.frame     # TimeFrame движка, должен совпадать с данными
+          $dateFrom   = $p.from
+          $dateTo     = $p.to
+          $exitDate   = $p.exit      # день, на первом баре которого выходим
+          Write-Host "набор: $preset ($dataFolder, $timeFrame, $dateFrom .. $dateTo)"
 
           $script:callId = 0
           function Call($name, $toolArgs) {
