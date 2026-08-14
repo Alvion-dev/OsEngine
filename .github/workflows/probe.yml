@@ -659,6 +659,12 @@ jobs:
 
             # Enter every candle, hold one: the shortest cycle this data allows,
             # which is what maximises the trade count on 633 daily candles.
+            #
+            # "Hold one" is one candle SEEN, not one bar of price exposure. The
+            # close is asked while the entry is still Opening and lands a candle
+            # later, so the trade actually spans two bars -- measured, {2: 6237}
+            # of 6250. That is why the noise band above is taken over $barSpan
+            # bars and not over one.
             $re = NewCalibBot "CalibRandomEntry" @{
               "Regime" = "On"; "Volume" = 1; "Seed" = $seed
               "Hold candles" = 1; "Try entry every N candles" = 1 }

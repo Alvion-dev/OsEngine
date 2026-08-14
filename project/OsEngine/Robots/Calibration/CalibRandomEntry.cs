@@ -31,6 +31,20 @@ over N trades is uncertain by roughly 2%/sqrt(N) -- at 300 trades that is about
 0.11%, and the cost being measured is 0.1%. The exact claim is therefore checked
 per trade -- every position must be charged (entry + close) * rate -- and the
 statistical one is reported with its error band rather than asserted.
+
+"Hold candles" is counted in candles SEEN, not in bars of price the trade is
+exposed to, and the two differ by design of the engine. With "Hold candles" = 1
+the robot asks to close on the candle after the one it entered on, but the entry
+is still Opening then and the request is swallowed; the close lands a candle
+later. Measured on 6250 minute trades: entry at open[i+1], exit at open[i+3] --
+two bars of price movement, not one.
+
+That is not a defect, but anything comparing this robot's result against price
+volatility must use the move over the bars it was actually exposed to. On June
+2026 minute SBER the two-bar move has sd 0.1953 RUB against 0.1387 for one bar,
+so a one-bar yardstick understates the noise band by 1.408 and overstates every
+"sigma" measured against it. The trades themselves agree with the two-bar
+figure: 0.1962 RUB.
 */
 
 namespace OsEngine.Robots.Calibration
