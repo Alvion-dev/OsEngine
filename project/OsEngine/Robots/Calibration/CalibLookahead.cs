@@ -35,9 +35,15 @@ An order placed when candle N finishes fills at the open of candle N+1 -- the
 engine emits open, high, low and close as trades and only then raises the
 candle-finished event, so the current candle's prices are already spent. This
 robot cannot close on the next candle: the position is still Opening then and
-the request is swallowed. It closes one bar later, which fills at the open of
-N+3. So what a long trade actually earns is open[N+3] - open[N+1], and that is
-the number it has to know in advance.
+the request is swallowed. On minute bars it closes one bar later and fills at
+the open of N+3, so a long trade earns open[N+3] - open[N+1].
+
+That offset is NOT a property of the engine, and calling it one was an error
+worth recording. It holds while the tester's clock step equals the bar size. On
+daily bars the clock still moves a minute at a time, so the pending order is
+filled during the idle steps between candles and the exit lands at N+2 instead.
+Hardcoding either number leaves the robot foreseeing one pair and trading
+another on every trade. The offset is a parameter, and the run measures it.
 
 Peeking at closes instead -- the obvious thing to write -- would foresee a
 quantity the robot never trades. It would still make money, because closes and
@@ -61,6 +67,7 @@ namespace OsEngine.Robots.Calibration
         private StrategyParameterString _regime;
         private StrategyParameterDecimal _volume;
         private StrategyParameterString _fileName;
+        private StrategyParameterInt _exitOffset;
 
         // candle time -> the two opens that a trade opened on that candle will
         // actually be filled at: entry at the first, exit at the second.
@@ -78,6 +85,26 @@ namespace OsEngine.Robots.Calibration
             _regime = CreateParameter("Regime", "Record", new[] { "Record", "Cheat", "Off" });
             _volume = CreateParameter("Volume", 1m, 1m, 100m, 1m);
             _fileName = CreateParameter("File", "calib-future.csv", new[] { "calib-future.csv" });
+
+            // How many bars ahead the EXIT lands. Not a constant, because it is
+            // not a property of this engine -- it is a property of the tester's
+            // clock step matching the bar size.
+            //
+            // On minute bars the two coincide: one step, one bar, and closing
+            // costs two bars (the first request is swallowed while the position
+            // is still Opening), so the exit fills at open[i+3].
+            //
+            // On daily bars the clock still steps by a minute, so 1439 idle
+            // steps separate one candle from the next. On the first of them
+            // CheckOrders already fills the pending order, and the position is
+            // Open before the robot is shown bar i+1 -- the close request goes
+            // through a bar earlier and the exit fills at open[i+2].
+            //
+            // Hardcoding either number makes the yardstick silently wrong on the
+            // other timeframe: the robot would foresee one pair and trade
+            // another, on every single trade. The run measures it instead --
+            // from the random-entry robot's own bar spans -- and passes it here.
+            _exitOffset = CreateParameter("Exit offset bars", 3, 2, 5, 1);
 
             _tab.CandleFinishedEvent += CandleFinished;
 
@@ -227,6 +254,8 @@ namespace OsEngine.Robots.Calibration
                 }
             }
 
+            int exitOffset = _exitOffset.ValueInt;
+
             // Each candle is mapped to the two opens this robot will actually
             // be filled at: entry and exit.
             //
@@ -245,13 +274,14 @@ namespace OsEngine.Robots.Calibration
             // corrected to what this engine requires, the foreseen pair stopped
             // being the traded pair -- and the gross win rate fell from 100% to
             // 76.7%, which is exactly what a yardstick is for.
-            for (int i = 0; i + 3 < times.Count; i++)
+            for (int i = 0; i + exitOffset < times.Count; i++)
             {
-                _future[times[i]] = new[] { opens[i + 1], opens[i + 3] };
+                _future[times[i]] = new[] { opens[i + 1], opens[i + exitOffset] };
             }
 
-            _tab.SetNewLogMessage("Calibration: loaded " + _future.Count + " future fills",
-                Logging.LogMessageType.System);
+            _tab.SetNewLogMessage(
+                "Calibration: loaded " + _future.Count + " future fills, exit offset "
+                + exitOffset, Logging.LogMessageType.System);
         }
     }
 }

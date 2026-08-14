@@ -403,6 +403,15 @@ jobs:
             [pscustomobject]@{
               key = $f[0] + $f[1]; d = $f[0]; open = [decimal]$f[2]; close = [decimal]$f[5] } })
           Write-Host "quotes: $($rows.Count) candles ($timeFrame), $($rows[0].key)..$($rows[-1].key)"
+          $barIndex = @{}
+          for ($i = 0; $i -lt $rows.Count; $i++) { $barIndex[$rows[$i].key] = $i }
+
+          # Сколько баров проходит между входом и выходом — величина, которую
+          # раньше я держал в голове как свойство движка. Это свойство совпадения
+          # шага часов тестера с размером бара, и на дневных данных оно другое.
+          # Поэтому дальше оно ЗАМЕРЯЕТСЯ по сделкам случайного входа и
+          # передаётся подглядывающему роботу, а не задаётся числом.
+          $script:barSpan = $null
 
           # The noise band for the random-entry check is measured here, not
           # guessed. A guessed volatility makes the band wrong in an unknown
@@ -645,6 +654,23 @@ jobs:
               $failures += "random entry seed ${seed}: $($rePositions.Count) round trips and no commission at all"
             }
             $results += $r
+
+            if ($null -eq $script:barSpan) {
+              $spans = @{}
+              foreach ($q in $rePositions) {
+                $a = $barIndex[([datetime]$q.open_time).ToString("yyyyMMddHHmmss")]
+                $b = $barIndex[([datetime]$q.close_time).ToString("yyyyMMddHHmmss")]
+                if ($null -ne $a -and $null -ne $b) {
+                  $d = $b - $a
+                  if ($spans.ContainsKey($d)) { $spans[$d]++ } else { $spans[$d] = 1 }
+                }
+              }
+              $top = ($spans.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1)
+              $script:barSpan = [int]$top.Key
+              Write-Host ("  замер: между входом и выходом {0} бар(ов) в {1} сделках из {2}" -f `
+                $script:barSpan, $top.Value, $rePositions.Count)
+            }
+
             Write-Host ("  seed {0,-8} trades {1,4}  long/short {2}/{3}  gross {4,8}  fee {5,7}  net {6,8}" -f `
               $seed, $r.count, $r.longs, $r.shorts,
               [math]::Round($r.gross,2), [math]::Round($r.fee,2), [math]::Round($r.net,2))
@@ -699,8 +725,19 @@ jobs:
           Call "tester_stop" @{} | Out-Null
           Call "bot_delete" @{ bot_id = $previousBot } | Out-Null
           WaitTesterServer
+          # Вход исполняется на следующем баре, поэтому сдвиг выхода на единицу
+          # больше замеренного пролёта. Если замер не удался — берём 3 и говорим
+          # об этом вслух, а не молча.
+          if ($null -eq $script:barSpan) {
+            Write-Host "  ! пролёт не замерен, беру 3 — на дневных данных это будет неверно"
+            $script:barSpan = 2
+          }
+          $exitOffset = $script:barSpan + 1
+          Write-Host "  сдвиг выхода для подглядывания: $exitOffset (замер + 1)"
+
           $rec = NewCalibBot "CalibLookahead" @{
-            "Regime" = "Record"; "Volume" = 1; "File" = "calib-future.csv" }
+            "Regime" = "Record"; "Volume" = 1; "File" = "calib-future.csv"
+            "Exit offset bars" = $exitOffset }
           RunTester
           if (-not (Test-Path $futureFile)) {
             $failures += "lookahead: the Record pass wrote no file at $futureFile"
@@ -717,7 +754,8 @@ jobs:
             Call "bot_delete" @{ bot_id = $rec } | Out-Null
             WaitTesterServer
             $che = NewCalibBot "CalibLookahead" @{
-              "Regime" = "Cheat"; "Volume" = 1; "File" = "calib-future.csv" }
+              "Regime" = "Cheat"; "Volume" = 1; "File" = "calib-future.csv"
+              "Exit offset bars" = $exitOffset }
             RunTester
             $chePositions = ClosedPositions $che
             Write-Host "  closed positions: $($chePositions.Count)"
