@@ -145,6 +145,11 @@ jobs:
       - name: Calibration — answers known before the tester runs
         if: env.MCP_ANSWERED == 'True'
         shell: pwsh
+        # Через окружение, а не ${{ }} внутри скрипта: выражение в теле run
+        # заставляет GitHub интерполировать ВЕСЬ блок, а он длиннее предела в
+        # 21000 знаков — запуск отвергается разбором, до сборки дело не доходит.
+        env:
+          PRESET: ${{ inputs.preset }}
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
@@ -167,7 +172,7 @@ jobs:
           # молчит: несовпадение папки и шага даёт не отказ, а пустой ряд и
           # ноль сделок. Поэтому наборы заданы целиком и выбираются одним
           # словом при запуске.
-          $preset = "${{ inputs.preset }}"
+          $preset = $env:PRESET
           if (-not $preset) { $preset = "Min1" }
           $presets = @{
             Min1  = @{ folder = "Min1";  frame = "Min1"
