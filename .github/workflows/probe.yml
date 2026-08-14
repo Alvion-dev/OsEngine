@@ -373,9 +373,19 @@ jobs:
                 $problems += "position $($p.number): profit_abs $($p.profit_abs), expected $([math]::Round($net,5))" }
               if ($problems.Count -ge 5) { break }
             }
+            # Разброс валовой одной сделки — эмпирическая полоса шума, которой
+            # проверяется полоса, посчитанная по котировкам. Считается по всем
+            # позициям, а не по первым пяти: обрыв выше касается только списка
+            # проблем.
+            $each = @($positions | ForEach-Object {
+              if ($_.direction -eq "Long") { [double](($_.close_price - $_.entry_price) * $_.volume) }
+              else { [double](($_.entry_price - $_.close_price) * $_.volume) } })
+            $tradeSd = if ($each.Count -gt 1) {
+              ($each | Measure-Object -StandardDeviation).StandardDeviation } else { 0.0 }
+
             return [pscustomobject]@{
               problems = $problems; gross = $sumGross; fee = $sumFee; net = $sumNet
-              grossLong = $grossLong; grossShort = $grossShort
+              grossLong = $grossLong; grossShort = $grossShort; tradeSd = $tradeSd
               longs = $longs; shorts = $shorts; count = $positions.Count }
           }
 
@@ -417,11 +427,24 @@ jobs:
           # guessed. A guessed volatility makes the band wrong in an unknown
           # direction, which turns "outside the band" into a statement about
           # the guess rather than about the engine.
-          $moves = @(for ($i = 1; $i -lt $rows.Count; $i++) { [double]($rows[$i].open - $rows[$i-1].open) })
-          $moveStats = $moves | Measure-Object -Average -StandardDeviation
-          $moveSd = $moveStats.StandardDeviation
-          Write-Host ("open-to-open move: mean {0} RUB, sd {1} RUB" -f `
-            [math]::Round($moveStats.Average,4), [math]::Round($moveSd,4))
+          #
+          # Меряется ход за СТОЛЬКО баров, сколько держится сделка. Однобаровый
+          # ход занижал полосу: сделка держится два бара, и на минутках Сбера
+          # июня 2026 разброс двухбарового хода 0,1953 ₽ против однобарового
+          # 0,1387 ₽ — в 1,408 раза. Полоса выходила уже настоящей, а «сигмы»
+          # над ней — больше настоящих: 62 вместо 44.
+          #
+          # Множителем sqrt(2) это не заменить. На дневных барах того же Сбера
+          # отношение 1,353, а не 1,414: настоящий ряд не случайное блуждание,
+          # и коэффициент у каждого таймфрейма свой. Поэтому ход за нужное
+          # число баров меряется, а не выводится.
+          function MoveSd([int]$span) {
+            $m = @(for ($i = $span; $i -lt $rows.Count; $i++) {
+              [double]($rows[$i].open - $rows[$i-$span].open) })
+            ($m | Measure-Object -StandardDeviation).StandardDeviation
+          }
+          $moveSd = MoveSd 1
+          Write-Host ("open-to-open move (1 bar): sd {0} RUB" -f [math]::Round($moveSd,4))
 
           # Open the tester inside the running window. terminal_launch restarts
           # the process; the tester server then never comes up.
@@ -681,11 +704,27 @@ jobs:
           if ($results.Count -ge 3) {
             $grosses = @($results | ForEach-Object { $_.gross })
             $avgTrades = ($results | ForEach-Object { $_.count } | Measure-Object -Average).Average
-            # Under the null each trade is one open-to-open move with a random
-            # sign, so a run's gross has sd = moveSd * sqrt(trades), and the
-            # average of k runs narrows that by sqrt(k).
-            $runSd  = $moveSd * [math]::Sqrt($avgTrades)
+            # Under the null each trade is one open-to-open move over the bars
+            # it is actually held, with a random sign, so a run's gross has
+            # sd = spanSd * sqrt(trades), and the average of k runs narrows
+            # that by sqrt(k).
+            $span   = if ($script:barSpan) { [int]$script:barSpan } else { 1 }
+            $spanSd = MoveSd $span
+            $runSd  = $spanSd * [math]::Sqrt($avgTrades)
             $meanSd = $runSd / [math]::Sqrt($results.Count)
+
+            # Полоса посчитана по котировкам — независимо от движка. Тот же
+            # разброс, посчитанный по его собственным сделкам, обязан совпасть:
+            # он о том же самом. Расхождение значит, что сделки ведут себя не
+            # как ряд, по которому построена полоса, и тогда неверна либо
+            # полоса, либо исполнение.
+            $tradeSd = ($results | ForEach-Object { $_.tradeSd } | Measure-Object -Average).Average
+            Write-Host ("  полоса шума: ход за {0} бар(ов) sd {1} RUB; по сделкам движка {2} RUB" -f `
+              $span, [math]::Round($spanSd,4), [math]::Round($tradeSd,4))
+            if ($spanSd -gt 0 -and ($tradeSd / $spanSd -gt 1.5 -or $tradeSd / $spanSd -lt 0.67)) {
+              $failures += ("noise band: quotes say {0} RUB a trade, the engine's own fills say {1} RUB -- the yardstick and the fills disagree about what a random trade is worth" -f `
+                [math]::Round($spanSd,4), [math]::Round($tradeSd,4))
+            }
             $mean   = ($grosses | Measure-Object -Average).Average
             $positive = @($grosses | Where-Object { $_ -gt 0 }).Count
 
@@ -714,10 +753,6 @@ jobs:
           # ===============================================================
           Write-Host ""
           Write-Host "=== 3. LOOKAHEAD ==="
-          # The coin-flip spread is the yardstick below. If section 2 did not
-          # produce it, fall back to the same formula on the trade count this
-          # robot will make, rather than dividing by nothing later.
-          if (-not $runSd) { $runSd = $moveSd * [math]::Sqrt($rows.Count / 2) }
           $futureFile = Join-Path $env:OSENGINE_DIR "calib-future.csv"
           if (Test-Path $futureFile) { Remove-Item $futureFile -Force }
 
@@ -734,6 +769,15 @@ jobs:
           }
           $exitOffset = $script:barSpan + 1
           Write-Host "  сдвиг выхода для подглядывания: $exitOffset (замер + 1)"
+
+          # Полоса шума — мерка ниже. Если раздел 2 её не построил, строим здесь
+          # по тому же правилу: ход за столько баров, сколько держится сделка.
+          # Делить на ничто позже нельзя, а брать однобаровый ход — значит
+          # занизить полосу и завысить «сигмы» над ней.
+          if (-not $runSd) {
+            $runSd = (MoveSd $script:barSpan) * [math]::Sqrt($rows.Count / 2)
+            Write-Host ("  полоса шума взята запасным путём: {0} RUB" -f [math]::Round($runSd,2))
+          }
 
           $rec = NewCalibBot "CalibLookahead" @{
             "Regime" = "Record"; "Volume" = 1; "File" = "calib-future.csv"
@@ -821,10 +865,38 @@ jobs:
                   [math]::Round($sigmas, 1))
               }
 
+              # Эталон, объявленный без оглядки на знак, читался наоборот.
+              # На минутках июня 2026 идеальное предвидение дало чистую
+              # -1216,28 ₽, то есть -4857% годовых, и прогон печатал:
+              # «идеальное предвидение стоит -4857% годовых; любая честная
+              # стратегия, приближающаяся к этому, протекает». Приблизиться к
+              # -4857% может только стратегия, теряющая всё, — и она объявлялась
+              # подглядывающей, а прибыльная оказывалась дальше от эталона и
+              # потому честной. Правило работало в обратную сторону.
+              #
+              # Отрицательный эталон — не сбой, а сам по себе вывод: на этой
+              # частоте комиссия съедает всё предсказуемое движение, и обгонять
+              # надо не рынок, а тариф.
+              $grossAnnualPct = ($r.gross / $avgEntry) * 100 / $years
+              $grossPerTrade  = $r.gross / $chePositions.Count
+              $feePerTrade    = $r.fee / $chePositions.Count
+
               Write-Host ""
-              Write-Host ("  YARDSTICK: on this data perfect foresight is worth {0}% a year." -f `
-                [math]::Round($annualPct, 0))
-              Write-Host  "  Any honest strategy on this data approaching that is leaking, not winning."
+              if ($annualPct -gt 0) {
+                Write-Host ("  ЭТАЛОН: идеальное предвидение стоит {0}% годовых после издержек." -f `
+                  [math]::Round($annualPct, 0))
+                Write-Host  "  Любая честная стратегия на этих данных, приближающаяся к этому, протекает, а не выигрывает."
+              } else {
+                Write-Host ("  ЭТАЛОН: после издержек идеальное предвидение УБЫТОЧНО — {0}% годовых." -f `
+                  [math]::Round($annualPct, 0))
+                Write-Host ("  До издержек оно стоит {0}% годовых: сигнал есть, и он огромен." -f `
+                  [math]::Round($grossAnnualPct, 0))
+                Write-Host ("  Съедает его тариф: {0} RUB предсказуемого хода на сделку против {1} RUB издержек." -f `
+                  [math]::Round($grossPerTrade, 4), [math]::Round($feePerTrade, 4))
+                Write-Host ("  Порог безубыточности здесь — {0}% с каждой стороны вместо нынешних {1}%." -f `
+                  [math]::Round($grossPerTrade / ($avgEntry * 2) * 100, 4), $commissionPercent)
+                Write-Host  "  Значит на этой частоте эталоном становится не подглядывание, а комиссия."
+              }
             }
           }
 
